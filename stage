@@ -1,5 +1,7 @@
 #!/bin/bash
 set -euo pipefail
+ADJUDICATOR="$HOME/.autocycle/adjudication.py"
+adjudication() { python3 "$ADJUDICATOR" "$@"; }
 
 usage() {
     echo "Usage:"
@@ -205,6 +207,13 @@ SHORT_SHA=""
 REMOTE_SHA=""
 
 refresh_state() {
+    if [[ "$MODE" == "--review-only" && "${AUTOCYCLE_LOCAL_REVIEW:-0}" == 1 ]]; then
+        BRANCH=$(git branch --show-current)
+        [[ -n "$BRANCH" ]] || fail "detached HEAD; local evidence preserved."
+        SHA=$(git rev-parse HEAD)
+        SHORT_SHA=$(git rev-parse --short HEAD)
+        return
+    fi
     BRANCH=$(git branch --show-current)
 
     [[ -n "$BRANCH" ]] || fail "detached HEAD."
@@ -252,15 +261,27 @@ mkdir -p "$LOG_DIR"
 CACHE_FILE="$LOG_DIR/current-review"
 QUEUE_HELPER="$HOME/.autocycle/instructions.py"
 HUMAN_INPUT_PROMPT=""
-if [[ -n "${AUTOCYCLE_INPUT_KEY:-}" ]]; then
-    [[ "$AUTOCYCLE_INPUT_KEY" == "${AUTOCYCLE_INPUT_BATCH:-}" ]] || fail "instruction batch identity mismatch."
-    case "$MODE" in
-        --review-only|--plan-only)
-            HUMAN_INPUT_PROMPT=$(python3 "$QUEUE_HELPER" --dir "$LOG_DIR" prompt "$AUTOCYCLE_INPUT_KEY") \
-                || fail "could not load frozen human input."
-            ;;
-    esac
+INPUT_CONTEXT=$(adjudication context "${AUTOCYCLE_INPUT_BATCH:-}") || fail "could not verify frozen input context."
+INPUT_COUNT=$(python3 -c 'import json,sys;print(json.loads(sys.argv[1])["count"])' "$INPUT_CONTEXT")
+EXPECTED_INPUT_STATUS=NONE
+VERIFIED_INPUT_KEY=""
+if (( INPUT_COUNT > 0 )); then
+    VERIFIED_INPUT_KEY="${AUTOCYCLE_INPUT_BATCH}"
+    EXPECTED_INPUT_STATUS="COMPLETE | PENDING"
 fi
+[[ "${AUTOCYCLE_INPUT_KEY:-}" == "$VERIFIED_INPUT_KEY" ]] || fail "instruction key disagrees with verified frozen context."
+case "$MODE" in
+    --review-only|--plan-only)
+        if [[ -n "$VERIFIED_INPUT_KEY" ]]; then
+            HUMAN_INPUT_PROMPT=$(python3 "$QUEUE_HELPER" --dir "$LOG_DIR" prompt "$VERIFIED_INPUT_KEY") \
+                || fail "could not load frozen human input."
+        fi
+        ;;
+esac
+INPUT_CONTEXT_PROMPT="Verified frozen input context for this invocation:
+Active instructions: $INPUT_COUNT
+Allowed INPUT_STATUS: $EXPECTED_INPUT_STATUS
+An empty batch is NOT an active instruction. Repository goals, unresolved implementation work and historical logs do not count as active queued instructions. Use only the allowed status values above."
 
 # AUTOCYCLE_STEP_INDEX_V1
 STEP_INDEX_PROMPT=""
@@ -269,6 +290,8 @@ case "$MODE" in
         STEP_INDEX_HISTORY=$(git log -40 --format='%h %s' -- IMPLEMENTATION.md)
         STEP_INDEX_PROMPT="
 Step indexing:
+$(adjudication numbering)
+- Only Plan revises IMPLEMENTATION.md. Keep the parent unresolved until its ORIGINAL acceptance criteria pass; carry those criteria into every repair child. Never weaken acceptance to make a blocker disappear.
 - Preserve the project's established detailed step IDs, including letters, dots and suffixes (for example 9M.1); do not collapse them to a broad phase such as Step 9 because human input mentions that phase.
 - Recalibrate against TARGET.md, IMPLEMENTATION.md, RESULT.md and the recent plan titles below. If the current heading has already lost detail, recover the most recent relevant detailed ID from history and map the requested work to that sequence.
 - Keep the existing ID when repairing or completing that same step. For a genuinely new bounded step, use the next unused ID in the established sequence; use its existing substep convention for inserted work. Do not renumber completed steps or confuse the autocycle cycle counter with project step IDs.
@@ -310,6 +333,10 @@ CHECKPOINT_SHORT=""
 
 load_review() {
     local FILE="$1"
+    local FIELD
+    for FIELD in REVIEW_STATUS REVIEW NEXT_STEP REVIEWED_SHA; do
+        [[ "$(grep -c "^$FIELD: " "$FILE" || true)" == 1 ]] || return 1
+    done
 
     STATUS_LINE=$(grep '^REVIEW_STATUS:' "$FILE" | tail -n 1 || true)
     REVIEW_LINE=$(grep '^REVIEW:' "$FILE" | tail -n 1 || true)
@@ -334,37 +361,32 @@ load_review() {
             ;;
     esac
 
-    [[ "$REVIEWED_SHA" == "$SHA" ]] || return 1
+    [[ -n "$REVIEW_TEXT" && -n "$NEXT_STEP" && "$REVIEWED_SHA" == "$SHA" ]] || return 1
 
     return 0
 }
 
 write_review_cache() {
-    cat > "$CACHE_FILE" <<CACHE_EOF
+    cat > "$CACHE_FILE.tmp.$$" <<CACHE_EOF
+REVIEW_POLICY: five-stage-v2
+REVIEW_IDENTITY: $REVIEW_IDENTITY
 CACHE_BRANCH: $BRANCH
-INPUT_BATCH: ${AUTOCYCLE_INPUT_KEY:-}
+INPUT_BATCH: ${AUTOCYCLE_INPUT_BATCH:-}
 $STATUS_LINE
 $REVIEW_LINE
 $NEXT_LINE
 $SHA_LINE
+HUMAN_ACTION: $HUMAN_ACTION
+BLOCKER_KEY: $BLOCKER_KEY
+INPUT_STATUS: $INPUT_STATUS
 CACHE_EOF
+    mv "$CACHE_FILE.tmp.$$" "$CACHE_FILE"
 }
 
 cached_review_is_valid() {
-    [[ -f "$CACHE_FILE" ]] || return 1
+    adjudication valid "$CACHE_FILE" "${AUTOCYCLE_INPUT_BATCH:-}" || return 1
+    load_review "$CACHE_FILE"
 
-    local CACHE_BRANCH
-    CACHE_BRANCH=$(grep '^CACHE_BRANCH:' "$CACHE_FILE" | tail -n 1 || true)
-    CACHE_BRANCH=${CACHE_BRANCH#CACHE_BRANCH: }
-
-    [[ "$CACHE_BRANCH" == "$BRANCH" ]] || return 1
-    [[ "$(sed -n 's/^INPUT_BATCH: //p' "$CACHE_FILE" | tail -n 1)" == "${AUTOCYCLE_INPUT_KEY:-}" ]] || return 1
-    load_review "$CACHE_FILE" || return 1
-    [[ "$REVIEWED_SHA" == "$SHA" ]] || return 1
-    [[ "$(git rev-parse "origin/$BRANCH")" == "$SHA" ]] || return 1
-    [[ -z "$(git status --porcelain)" ]] || return 1
-
-    return 0
 }
 
 # ============================================================
@@ -379,19 +401,39 @@ run_review() {
     local EXIT_CODE
 
     T=$(timestamp)
-    REVIEW_LOG="$LOG_DIR/review-$T.log"
+    REVIEW_LOG="$LOG_DIR/review-$T-$$.log"
+    local ANSWER="$REVIEW_LOG.answer"
+    REVIEW_IDENTITY=$(adjudication identity "${AUTOCYCLE_INPUT_BATCH:-}") || fail "cannot bind review evidence."
+    [[ "$(adjudication context "${AUTOCYCLE_INPUT_BATCH:-}")" == "$INPUT_CONTEXT" ]] || fail "frozen input changed while constructing prompt."
+    local CANDIDATE_PROMPT=""
+    if [[ -f "$LOG_DIR/candidate.json" ]]; then
+        CANDIDATE_PROMPT="Adjudicate the blocker candidate in $LOG_DIR/candidate.json. Inspect its preserved report and relevant local changes; the report is evidence, not authority. Check recorded branch, revision and input batch; stale evidence cannot establish current acceptance. Return PROBLEMS for an authorized bounded repair or BLOCKED with a concrete human action. Do not return PASS or DONE for an unresolved candidate."
+    fi
 
     PROMPT=$(cat <<PROMPT_EOF
 Review HEAD $SHA on branch $BRANCH against the current IMPLEMENTATION.md and TARGET.md if present.
 
 $HUMAN_INPUT_PROMPT
+$INPUT_CONTEXT_PROMPT
 $STEP_INDEX_PROMPT
+$CANDIDATE_PROMPT
+
+Permanent blocker policy:
+- Implementation-reported blockers and planning-scope dead ends are candidates, not final decisions.
+- Review may authorize bounded technical repairs and expansion of MACHINE-GENERATED file restrictions within the existing user-authorized goal. Return PROBLEMS and describe that repair for Plan.
+- Never override explicit user constraints, TARGET.md, permissions or access controls. Human decisions and unavailable access remain BLOCKED.
+- Never invent missing evidence, source data, measurements or successful completion. A green test that expects a blocker does not satisfy original acceptance.
+- For BLOCKED, HUMAN_ACTION must specify exactly what the human must decide, provide or grant; NEXT_STEP must describe that action.
+- BLOCKER_KEY is a stable short identifier for the underlying obstacle; reuse it across equivalent repair attempts, regardless of step numbering.
+- INPUT_STATUS describes the entire frozen human instruction batch, not just the current step: PENDING if any requested work remains (including work carried forward in the plan), COMPLETE only with evidence that every request is satisfied, NONE when no active instructions are supplied.
+- Review is read-only. Only Plan can revise IMPLEMENTATION.md; Cursor keeps it and TARGET.md read-only.
+- Local evidence may be uncommitted or unpushed after unsafe/failed checkpointing. Diagnose it without requiring a push; do not call preservation successful implementation.
 
 Inspect only what is necessary:
 - latest implementation diff
 - changed files
 - directly relevant tests/evidence
-- $LOG_DIR/latest-implementation, if present: use its log only if HEAD and branch match; assess actual verification, not todo labels alone
+- $LOG_DIR/latest-implementation, if present: verify its branch and implementation baseline against HEAD or the preceding checkpoint (baseline must be an ancestor and the intervening commit must record this implementation). Assess the log and actual diff; do not ignore preceding implementation evidence merely because Checkpoint advanced HEAD. Missing or mismatched evidence cannot establish acceptance.
 - An implementation may legitimately produce no diff; evaluate acceptance against the current files and evidence.
 
 Avoid broad repository scans unless needed.
@@ -404,28 +446,60 @@ REVIEW_STATUS: PASS | PROBLEMS | DONE | BLOCKED
 REVIEW: <maximum 25 words>
 NEXT_STEP: <one bounded next step, maximum 30 words, or NONE>
 REVIEWED_SHA: $SHA
+HUMAN_ACTION: <concrete human action for BLOCKED, otherwise NONE>
+BLOCKER_KEY: <stable obstacle identifier, or NONE>
+INPUT_STATUS: $EXPECTED_INPUT_STATUS
 PROMPT_EOF
 )
 
     set +e
-    codex exec --sandbox read-only "$PROMPT" \
+    adjudication run "${AUTOCYCLE_PROVIDER_TIMEOUT:-900}" codex exec --sandbox read-only --output-last-message "$ANSWER" "$PROMPT" \
         >"$REVIEW_LOG" 2>&1
     EXIT_CODE=$?
     set -e
 
     if [[ "$EXIT_CODE" -ne 0 ]]; then
-        tail -n 15 "$REVIEW_LOG"
+        echo "Review provider unsuccessful (exit $EXIT_CODE; 124 means timed out). Log: $REVIEW_LOG"
         fail "Codex review. Log: $REVIEW_LOG"
     fi
 
-    load_review "$REVIEW_LOG" \
+    load_review "$ANSWER" \
         || fail "invalid Codex review. Log: $REVIEW_LOG"
 
     [[ "$(git rev-parse HEAD)" == "$SHA" ]] \
         || fail "HEAD changed during review."
 
-    [[ -z "$(git status --porcelain)" ]] \
-        || fail "repository changed during review."
+    [[ "$(adjudication identity "${AUTOCYCLE_INPUT_BATCH:-}")" == "$REVIEW_IDENTITY" ]] \
+        || fail "repository or evidence changed during review; decision discarded."
+    for FIELD in HUMAN_ACTION BLOCKER_KEY; do
+        [[ "$(grep -c "^$FIELD: " "$ANSWER" || true)" == 1 ]] || fail "ambiguous adjudication field $FIELD."
+    done
+    INPUT_STATUS=$(sed -n 's/^INPUT_STATUS: //p' "$ANSWER")
+    if ! python3 - "$INPUT_CONTEXT" "$INPUT_STATUS" "$REVIEW_LOG.diagnostic.json" <<'STATUS_PY'
+import json,sys
+context=json.loads(sys.argv[1]);received=sys.argv[2]
+if received not in context['allowed']:
+    # Never print arbitrary provider output or instruction text.
+    safe=received if received in ('COMPLETE','PENDING','NONE') else '<malformed>'
+    data=dict(context,received=safe)
+    with open(sys.argv[3],'w') as f:json.dump(data,f,sort_keys=True)
+    print('Instruction status: expected '+ ' | '.join(context['allowed'])+'; received '+safe+'. Diagnostic: '+sys.argv[3])
+    sys.exit(1)
+STATUS_PY
+    then
+        fail "invalid instruction completion status; review not accepted."
+    fi
+    [[ "$STATUS" != DONE || "$INPUT_STATUS" != PENDING ]] || fail "DONE cannot leave active instructions pending. Log: $REVIEW_LOG"
+    HUMAN_ACTION=$(sed -n 's/^HUMAN_ACTION: //p' "$ANSWER")
+    BLOCKER_KEY=$(sed -n 's/^BLOCKER_KEY: //p' "$ANSWER")
+    [[ -n "$HUMAN_ACTION" && -n "$BLOCKER_KEY" ]] || fail "invalid adjudication fields; rerun review."
+    if [[ "$STATUS" == BLOCKED ]]; then
+        [[ "$HUMAN_ACTION" != NONE && "$NEXT_STEP" != NONE ]] || fail "BLOCKED lacks concrete human action."
+    fi
+    if [[ -f "$LOG_DIR/candidate.json" ]]; then
+        [[ "$STATUS" == PROBLEMS || "$STATUS" == BLOCKED ]] || fail "candidate needs PROBLEMS or BLOCKED adjudication."
+        [[ "$BLOCKER_KEY" != NONE ]] || fail "candidate lacks stable blocker key."
+    fi
 
     printf '\nAUTOCYCLE_REVIEW_INPUT: %s\n' "${AUTOCYCLE_INPUT_KEY:-}" >> "$REVIEW_LOG"
     write_review_cache
@@ -448,7 +522,8 @@ run_plan() {
     local FIRST_LINE
 
     T=$(timestamp)
-    PLAN_LOG="$LOG_DIR/plan-$T.log"
+    PLAN_LOG="$LOG_DIR/plan-$T-$$.log"
+    local ANSWER="$PLAN_LOG.answer"
     PLAN_FILE="$LOG_DIR/IMPLEMENTATION-$T.md"
 
     PROMPT=$(cat <<PROMPT_EOF
@@ -465,6 +540,10 @@ Read existing IMPLEMENTATION.md, TARGET.md, and directly relevant files only as 
 
 Rules:
 - One bounded implementation step.
+- Review can authorize bounded technical repair and expansion of machine-generated file restrictions within the existing user-authorized goal. It cannot override explicit user constraints, TARGET.md, permissions or access controls.
+- Preserve the parent original acceptance criteria and unresolved status when inserting a repair child; inspect the numbering history above before choosing an unused child ID such as 9M.2.4.1.
+- Missing evidence must not be invented; human decisions and unavailable access remain blockers.
+- If no authorized bounded plan is possible, output PLAN_STATUS: BLOCKED followed by BLOCKER: <concrete reason>, without a plan block. This is a candidate for read-only Review, not a final decision.
 - Cursor must never modify TARGET.md or IMPLEMENTATION.md.
 - Direct completion records and measured verification to RESULT.md.
 - Read RESULT.md when assessing the previous step.
@@ -486,7 +565,7 @@ PROMPT_EOF
 )
 
     set +e
-    codex exec --sandbox read-only "$PROMPT" \
+    adjudication run "${AUTOCYCLE_PROVIDER_TIMEOUT:-900}" codex exec --sandbox read-only --output-last-message "$ANSWER" "$PROMPT" \
         >"$PLAN_LOG" 2>&1
     EXIT_CODE=$?
     set -e
@@ -496,24 +575,29 @@ PROMPT_EOF
         fail "Codex planning. Log: $PLAN_LOG"
     fi
 
-    if grep -q '^PLAN_STATUS: BLOCKED$' "$PLAN_LOG"; then
-        live_fail
-        echo "BLOCKED: planner could not reconcile the active instructions. Log: $PLAN_LOG"
-        exit 2
+    if grep -q '^PLAN_STATUS:' "$ANSWER"; then
+        [[ "$(grep -c '^PLAN_STATUS:' "$ANSWER")" == 1 ]] && grep -qx 'PLAN_STATUS: BLOCKED' "$ANSWER" \
+            || fail "malformed planning status."
+        [[ "$(grep -c '^BLOCKER: .\+' "$ANSWER" || true)" == 1 ]] || fail "planning blocker lacks reason."
+        ! grep -Eq '^(BEGIN_IMPLEMENTATION_MD|END_IMPLEMENTATION_MD)$' "$ANSWER" || fail "mixed planning blocker and implementation block."
+        adjudication candidate planning "$ANSWER" "${AUTOCYCLE_INPUT_BATCH:-}" || fail "cannot preserve planning blocker."
+        live_finish "↪" "Blocker candidate → Review"
+        exit 42
     fi
 
-    # The transcript contains our prompt too.
-    # Use the LAST marker pair, which belongs to Codex's answer.
+    # Parse only the final answer, with exactly one unambiguous marker pair.
+    [[ "$(grep -c '^BEGIN_IMPLEMENTATION_MD$' "$ANSWER" || true)" == 1 && \
+       "$(grep -c '^END_IMPLEMENTATION_MD$' "$ANSWER" || true)" == 1 ]] || fail "ambiguous planning markers."
 
     BEGIN_LINE=$(
-        grep -n '^BEGIN_IMPLEMENTATION_MD$' "$PLAN_LOG" \
+        grep -n '^BEGIN_IMPLEMENTATION_MD$' "$ANSWER" \
             | tail -n 1 \
             | cut -d: -f1 \
             || true
     )
 
     END_LINE=$(
-        grep -n '^END_IMPLEMENTATION_MD$' "$PLAN_LOG" \
+        grep -n '^END_IMPLEMENTATION_MD$' "$ANSWER" \
             | tail -n 1 \
             | cut -d: -f1 \
             || true
@@ -529,7 +613,7 @@ PROMPT_EOF
         || fail "planner returned malformed markers."
 
     sed -n "$((BEGIN_LINE + 1)),$((END_LINE - 1))p" \
-        "$PLAN_LOG" > "$PLAN_FILE"
+        "$ANSWER" > "$PLAN_FILE"
 
     [[ -s "$PLAN_FILE" ]] \
         || fail "planner returned an empty IMPLEMENTATION.md."
@@ -580,8 +664,12 @@ push_plan() {
 
     CHANGES=$(git -C "$WORKTREE" status --porcelain)
 
-    [[ -n "$CHANGES" ]] \
-        || fail "new IMPLEMENTATION.md is identical to the old one."
+    if [[ -z "$CHANGES" ]]; then
+        printf 'PLAN_STATUS: BLOCKED\nBLOCKER: generated plan is identical; no authorized progress was planned.\n' > "$PLAN_FILE.blocker"
+        adjudication candidate planning "$PLAN_FILE.blocker" "${AUTOCYCLE_INPUT_BATCH:-}" || fail "cannot preserve planning dead end."
+        live_finish "↪" "Unchanged plan → Review"
+        exit 42
+    fi
 
     CHANGED_PATHS=$(
         git -C "$WORKTREE" status --porcelain \
@@ -729,7 +817,8 @@ run_cursor() {
     local EXIT_CODE
 
     T=$(timestamp)
-    CURSOR_LOG="$LOG_DIR/cursor-$T.log"
+    CURSOR_LOG="$LOG_DIR/cursor-$T-$$.log"
+    adjudication baseline || fail "cannot preserve implementation baseline."
     BEFORE_SHA=$(git rev-parse HEAD)
     assert_owned_docs "$BEFORE_SHA"
 
@@ -781,6 +870,7 @@ let renderedLines = 0;
 let finished = false;
 let shuttingDown = false;
 let retryableStall = false;
+let responseText = "";
 
 function elapsed() {
   const seconds = Math.floor((Date.now() - started) / 1000);
@@ -946,6 +1036,11 @@ rl.on("line", line => {
   const updateText =
     msg?.params?.update?.content?.text;
 
+  if (msg.method === "session/update" &&
+      msg.params?.update?.sessionUpdate === "agent_message_chunk" && typeof updateText === "string") {
+    responseText += updateText;
+  }
+
   if (
     msg.method === "session/update" &&
     typeof updateText === "string" &&
@@ -1078,6 +1173,10 @@ Requirements:
 - Do not begin the next implementation step.
 - Do not ask the user questions.
 - If external input is genuinely required, stop instead of guessing.
+- End with IMPLEMENT_STATUS: COMPLETE only after measured acceptance passes.
+- If scope, missing evidence or required human input prevents completion, preserve correct partial work and evidence in RESULT.md, then return IMPLEMENT_STATUS: BLOCKED and BLOCKER: <concrete reason>. Do not mark unresolved todos completed.
+- Do not expand file restrictions yourself; Review adjudicates and Plan alone revises the plan.
+- Never invent evidence or bypass explicit user constraints, TARGET.md, permissions or access controls.
 - Keep the final prose response extremely short; the todo display is the primary result.
 `;
 
@@ -1136,7 +1235,15 @@ async function main() {
     });
 
     log.write(`\n[result] stopReason=${result?.stopReason || "unknown"}\n`);
-    validateCompletion(result, todoOrder.map(id => todos.get(id)).filter(Boolean));
+    const statuses = [...responseText.matchAll(/^IMPLEMENT_STATUS: (COMPLETE|BLOCKED)\s*$/gm)];
+    if (result?.stopReason !== "end_turn" || statuses.length !== 1) {
+      throw new Error("Interrupted or malformed implementation response; evidence preserved.");
+    }
+    const blocked = statuses[0][1] === "BLOCKED";
+    if (blocked && !/^BLOCKER: \S.+/m.test(responseText)) {
+      throw new Error("Implementation blocker has no concrete reason.");
+    }
+    if (!blocked) validateCompletion(result, todoOrder.map(id => todos.get(id)).filter(Boolean));
     if (git("branch", "--show-current") !== beforeBranch) {
       throw new Error("Cursor switched Git branches.");
     }
@@ -1154,6 +1261,15 @@ async function main() {
       log.write("\n[result] no_changes=true; normal completion accepted\n");
     }
 
+    if (blocked) {
+      clearInterval(timer);
+      shuttingDown = true;
+      agent.stdin.end();
+      agent.kill();
+      process.stdout.write("Implement   ↪ blocker candidate (partial work preserved)\n");
+      log.end(() => process.exit(42));
+      return;
+    }
     finished = true;
 
     clearInterval(timer);
@@ -1225,6 +1341,13 @@ NODE
         fail "implementation connection stalled after 3 attempts. Log: $CURSOR_LOG"
     fi
 
+    if [[ "$EXIT_CODE" -eq 42 ]]; then
+        adjudication candidate implementation "$CURSOR_LOG" "${AUTOCYCLE_INPUT_BATCH:-}" || fail "cannot preserve blocker evidence."
+        printf 'HEAD: %s\nBRANCH: %s\nLOG: %s\nOUTCOME: BLOCKED_CANDIDATE\n' \
+            "$BEFORE_SHA" "$(git branch --show-current)" "$CURSOR_LOG" > "$LOG_DIR/latest-implementation.tmp.$$"
+        mv "$LOG_DIR/latest-implementation.tmp.$$" "$LOG_DIR/latest-implementation"
+        exit 42
+    fi
     if [[ "$EXIT_CODE" -ne 0 ]]; then
         fail "implementation. Log: $CURSOR_LOG"
     fi
@@ -1232,7 +1355,11 @@ NODE
     [[ "$(git rev-parse HEAD)" == "$BEFORE_SHA" ]] \
         || fail "implementation changed Git HEAD."
 
-    assert_owned_docs "$BEFORE_SHA"
+    if ! (assert_owned_docs "$BEFORE_SHA"); then
+        adjudication candidate checkpoint "$CURSOR_LOG" "${AUTOCYCLE_INPUT_BATCH:-}" || fail "cannot preserve ownership evidence."
+        exit 42
+    fi
+    adjudication implementation-result || fail "cannot freeze implementation work for checkpoint."
 
     # Save a pointer to this successful run's evidence, including no-change runs.
     local EVIDENCE_TMP="$LOG_DIR/latest-implementation.tmp.$$"

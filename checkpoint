@@ -58,7 +58,19 @@ else
     fi
 fi
 
+# AutoCycle supplies a frozen provider result and a clean ownership baseline.
+# Recheck immediately around staging; on failure preserve both work and index.
+owned_checkpoint_guard() {
+    if [[ "${AUTOCYCLE_CHECKPOINT_GUARD:-0}" == 1 ]]; then
+        python3 "$HOME/.autocycle/adjudication.py" checkpoint-safe || {
+            echo "Checkpoint ownership/evidence changed; work and index preserved."
+            return 1
+        }
+    fi
+}
+owned_checkpoint_guard
 git add -A
+owned_checkpoint_guard
 
 if ! OUTPUT=$(git commit -m "$MESSAGE" 2>&1); then
     echo "$OUTPUT"

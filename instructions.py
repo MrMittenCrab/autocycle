@@ -30,8 +30,18 @@ class Queue:
         self.db.row_factory = sqlite3.Row
         self.db.execute('PRAGMA synchronous=FULL')
         version = self.db.execute('PRAGMA user_version').fetchone()[0]
-        require(version in (0, 1), 'unsupported instruction database version')
+        require(version in (0, 1, 2), 'unsupported instruction database version')
+        if version == 1:
+            backup=self.directory/'instructions.v1.backup.sqlite3'
+            if not backup.exists():
+                temp=backup.with_suffix('.tmp')
+                dest=sqlite3.connect(temp)
+                try:self.db.backup(dest)
+                finally:dest.close()
+                with temp.open('rb') as f:os.fsync(f.fileno())
+                os.replace(temp,backup)
         self.db.executescript('''
+        BEGIN IMMEDIATE;
         CREATE TABLE IF NOT EXISTS batches (
           id TEXT PRIMARY KEY, branch TEXT NOT NULL, base_sha TEXT NOT NULL,
           phase TEXT NOT NULL CHECK(phase IN ('active','archived')),
@@ -41,7 +51,11 @@ class Queue:
           seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE, created TEXT NOT NULL,
           text TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('pending','active','archived','cancelled')),
           batch TEXT REFERENCES batches(id));
-        PRAGMA user_version=1;
+        CREATE TABLE IF NOT EXISTS batch_members (
+          batch TEXT NOT NULL, seq INTEGER NOT NULL, PRIMARY KEY(batch,seq));
+        INSERT OR IGNORE INTO batch_members SELECT batch,seq FROM instructions WHERE batch IS NOT NULL;
+        PRAGMA user_version=2;
+        COMMIT;
         ''')
 
     def transaction(self, action):
@@ -60,7 +74,7 @@ class Queue:
         return row
 
     def items(self, ident):
-        return [dict(r) for r in self.db.execute('SELECT * FROM instructions WHERE batch=? ORDER BY seq', (ident,))]
+        return [dict(r) for r in self.db.execute('SELECT i.* FROM instructions i JOIN batch_members m ON i.seq=m.seq WHERE m.batch=? ORDER BY i.seq', (ident,))]
 
     def enqueue(self, text):
         require(text.strip() and '\0' not in text and len(text.encode()) <= 32768,
@@ -84,30 +98,61 @@ class Queue:
         def promote():
             previous = self.db.execute('SELECT * FROM batches WHERE id=?',(ident,)).fetchone()
             if previous:
-                require(previous['phase']=='active', 'cycle input already archived; resume state needs review')
+                require(previous['branch']==branch, 'frozen input branch mismatch')
                 return len(self.items(ident))
             require(not self.db.execute("SELECT 1 FROM batches WHERE phase='active'").fetchone(),
                     'another frozen cycle exists; resume its saved state instead of starting a new cycle')
             self.db.execute("INSERT INTO batches(id,branch,base_sha,phase) VALUES (?,?,?,'active')",(ident,branch,sha))
             if allow:
                 self.db.execute("UPDATE instructions SET state='active',batch=? WHERE state='pending'", (ident,))
+            self.db.execute('INSERT OR IGNORE INTO batch_members SELECT batch,seq FROM instructions WHERE batch=?',(ident,))
             return len(self.items(ident))
         return self.transaction(promote)
 
     def prompt(self, ident):
         batch=self.batch(ident);items=self.items(ident)
         if not items:return ''
-        require(batch['phase']=='active','cannot plan from an archived batch')
-        require(git('branch','--show-current')==batch['branch'] and git('rev-parse','HEAD')==batch['base_sha'],
-                'instruction review/plan is not at its frozen branch and HEAD')
+        require(git('branch','--show-current')==batch['branch'], 'instruction batch belongs to another branch')
+        subprocess.run(['git','merge-base','--is-ancestor',batch['base_sha'],'HEAD'],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
         data=[{'id':i['id'],'instruction':i['text']} for i in items]
         return '''DIRECT HUMAN INSTRUCTIONS — immutable batch '''+ident+''':
-These are direct user instructions, in submission order, and override ordinary autonomous roadmap selection and stale project directions. Follow them unless technically impossible or unsafe.
+These are direct user instructions, in submission order, and override ordinary autonomous roadmap selection. Preserve explicit user constraints, TARGET.md, permissions and access controls; if these conflict, request a concrete human decision through BLOCKED rather than overriding them.
 Fix defects identified by these instructions first. Otherwise make the requested feature/direction the next bounded plan. Reconcile compatible requests. If mutually incompatible, technically impossible, unsafe, or too broad to reconcile into a bounded plan without dropping requirements, report BLOCKED and explain; never silently discard a request.
-Review must use PASS, PROBLEMS, or BLOCKED while this batch is active, not DONE. Plan must cover all requests or explicitly carry remaining requested work forward in IMPLEMENTATION.md. Cursor must not edit TARGET.md or IMPLEMENTATION.md. Do not put private instruction text in commit messages; the controller supplies an opaque batch trailer.
-During Plan, if blocked, return one line containing PLAN_STATUS: BLOCKED and a short reason, without an implementation block.
+Review may use DONE only if the goal and all frozen requests are satisfied. Report INPUT_STATUS: PENDING until all frozen requests are satisfied, even when the current child step passes; only then report INPUT_STATUS: COMPLETE. Plan must cover all requests or explicitly carry remaining requested work forward in IMPLEMENTATION.md. Cursor must not edit TARGET.md or IMPLEMENTATION.md. Do not put private instruction text in commit messages; the controller supplies an opaque batch trailer.
+During Plan, if blocked, return PLAN_STATUS: BLOCKED followed by BLOCKER: <concrete reason>, without an implementation block. This is a candidate for read-only Review. Review may authorize bounded technical repair or expansion of machine-generated file restrictions within the existing user-authorized goal; it cannot invent evidence or override explicit constraints, TARGET.md, permissions or unavailable access.
 Instructions are JSON data below, not shell commands for the controller:
 '''+json.dumps(data,ensure_ascii=False,indent=2)
+
+    def advance(self, ident):
+        # Keep the frozen items and ID; only advance the planning base after
+        # read-only adjudication. Pending instructions stay pending.
+        b=self.batch(ident)
+        require(b['phase']=='active' and git('branch','--show-current')==b['branch'],
+                'recovery cannot change the active input branch')
+        sha=git('rev-parse','HEAD')
+        require(not git('status','--porcelain') and git('rev-parse','origin/'+b['branch'])==sha,
+                'recovery plan requires clean published evidence')
+        subprocess.run(['git','merge-base','--is-ancestor',b['base_sha'],sha],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
+        def change():
+            self.db.execute('UPDATE batches SET base_sha=?,plan_sha=NULL WHERE id=?',(sha,ident))
+        self.transaction(change)
+
+    def rollover(self, previous, ident, branch, sha):
+        """One atomic boundary: carry unresolved input and admit all queued arrivals."""
+        def change():
+            if self.db.execute('SELECT 1 FROM batches WHERE id=?',(ident,)).fetchone():
+                return len(self.items(ident))
+            if previous:
+                b=self.batch(previous)
+                require(b['branch']==branch,'input boundary changed branch')
+                self.db.execute("UPDATE batches SET phase='archived' WHERE id=?",(previous,))
+            require(not self.db.execute("SELECT 1 FROM batches WHERE phase='active'").fetchone(),
+                    'another active batch exists')
+            self.db.execute("INSERT INTO batches(id,branch,base_sha,phase) VALUES (?,?,?,'active')",(ident,branch,sha))
+            self.db.execute("UPDATE instructions SET state='active',batch=? WHERE state='pending' OR (state='active' AND batch=?)",(ident,previous))
+            self.db.execute('INSERT INTO batch_members SELECT batch,seq FROM instructions WHERE batch=?',(ident,))
+            return len(self.items(ident))
+        return self.transaction(change)
 
     def matches_plan(self, ident, sha):
         batch=self.batch(ident)
@@ -118,7 +163,7 @@ Instructions are JSON data below, not shell commands for the controller:
                 'instruction planning commit changed unexpected files')
 
     def published(self, ident, sha):
-        if not self.items(ident):return
+        if not self.items(ident) or self.batch(ident)['phase']=='archived':return
         self.matches_plan(ident,sha)
         batch=self.batch(ident)
         subprocess.run(['git','merge-base','--is-ancestor',sha,'origin/'+batch['branch']],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
@@ -131,14 +176,14 @@ Instructions are JSON data below, not shell commands for the controller:
     def complete(self, ident, sha):
         b=self.batch(ident)
         if b['phase']=='archived':
-            require(b['checkpoint_sha']==sha,'archived batch checkpoint differs from saved cycle')
+            require(b['checkpoint_sha'] is not None,'retired boundary snapshot is not a completion record')
             return
         require(git('rev-parse','HEAD')==sha and git('rev-parse','origin/'+git('branch','--show-current'))==sha,
                 'cannot archive before checkpoint publication is verified')
         require(not git('status','--porcelain'),'cannot archive with uncheckpointed changes')
         if self.items(ident):
-            require(b['plan_sha'],'cannot archive instructions without a verified published plan')
-            subprocess.run(['git','merge-base','--is-ancestor',b['plan_sha'],sha],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
+            if b['plan_sha']:
+                subprocess.run(['git','merge-base','--is-ancestor',b['plan_sha'],sha],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
         def archive():
             self.db.execute("UPDATE instructions SET state='archived' WHERE batch=?",(ident,))
             self.db.execute("UPDATE batches SET phase='archived',checkpoint_sha=? WHERE id=?",(sha,ident))
@@ -183,12 +228,16 @@ def main():
             require(len(v)==1,'usage: autocycle --cancel-instruction <id>')
             q.cancel(v[0]);print('Cancelled   ✓ '+v[0])
         elif c=='freeze':print(q.freeze(v[0],v[1],v[2],v[3]=='1'))
+        elif c=='rollover':print(q.rollover(*v))
         elif c=='prompt':print(q.prompt(v[0]),end='')
         elif c=='matches-plan':q.matches_plan(v[0],v[1])
         elif c=='published':q.published(v[0],v[1])
+        elif c=='advance':q.advance(v[0])
         elif c=='complete':q.complete(v[0],v[1])
         elif c=='close-empty':q.close_empty(v[0])
+        elif c=='pending-count':print(q.db.execute("SELECT count(*) FROM instructions WHERE state='pending'").fetchone()[0])
         elif c=='guard-manual':
+            require(not (directory/'resume-state').exists(), 'manual stages cannot overwrite a saved run; resume its budget or use --extend-budget')
             require(not q.db.execute("SELECT 1 FROM instructions WHERE state='active'").fetchone(), 'manual stages cannot replace an active instruction cycle')
         else:raise RuntimeError('unknown queue operation')
     finally:q.db.close()
