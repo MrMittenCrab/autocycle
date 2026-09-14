@@ -1,0 +1,63 @@
+#!/bin/bash
+set -euo pipefail
+
+ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || {
+    echo "Sync failed: not inside a Git repository."
+    exit 1
+}
+
+cd "$ROOT"
+
+BRANCH=$(git branch --show-current)
+
+if [[ -z "$BRANCH" ]]; then
+    echo "Sync failed: detached HEAD."
+    exit 1
+fi
+
+if [[ -n "$(git status --porcelain)" ]]; then
+    echo "Sync blocked: uncommitted changes."
+    git status --short
+    exit 1
+fi
+
+if ! git fetch --prune origin >/dev/null 2>&1; then
+    echo "Sync failed: fetch."
+    exit 1
+fi
+
+if [[ "$BRANCH" != "main" ]] \
+    && git show-ref --verify --quiet refs/remotes/origin/main \
+    && git merge-base --is-ancestor HEAD origin/main; then
+
+    if git show-ref --verify --quiet refs/heads/main; then
+        git switch main >/dev/null 2>&1
+    else
+        git switch --track -c main origin/main >/dev/null 2>&1
+    fi
+
+    BRANCH="main"
+fi
+
+if git show-ref --verify --quiet "refs/remotes/origin/$BRANCH"; then
+    if ! git merge --ff-only "origin/$BRANCH" >/dev/null 2>&1; then
+        echo "Sync failed: $BRANCH cannot fast-forward."
+        exit 1
+    fi
+fi
+
+SHORT_SHA=$(git rev-parse --short HEAD)
+
+echo "Synced: $BRANCH @ $SHORT_SHA"
+
+if [[ -f IMPLEMENTATION.md ]]; then
+    TITLE=$(head -n 1 IMPLEMENTATION.md)
+    echo "${TITLE#\# }"
+
+    GOAL="${TITLE#* — }"
+    echo "Goal: $GOAL"
+
+    echo "Tasks:"
+    grep '^### Task ' IMPLEMENTATION.md \
+        | sed -E 's/^### Task [0-9]+: /- /' || true
+fi

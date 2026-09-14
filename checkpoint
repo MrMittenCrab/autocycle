@@ -1,0 +1,74 @@
+#!/bin/bash
+set -euo pipefail
+
+ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || {
+    echo "Not inside a Git repository."
+    exit 1
+}
+
+cd "$ROOT"
+
+if [[ -z "$(git status --porcelain)" ]]; then
+    echo "Nothing to checkpoint."
+    exit 0
+fi
+
+BRANCH=$(git branch --show-current)
+
+if [[ -z "$BRANCH" ]]; then
+    echo "Detached HEAD. Refusing."
+    exit 1
+fi
+
+git fetch --prune origin >/dev/null
+
+# Never commit implementation work directly to main or a planning branch.
+# If we are not already on a checkpoint branch, create one.
+if [[ "$BRANCH" != checkpoint/* ]]; then
+    BRANCH="checkpoint/$(date +%Y%m%d-%H%M%S)"
+
+    while git show-ref --verify --quiet "refs/heads/$BRANCH" \
+       || git show-ref --verify --quiet "refs/remotes/origin/$BRANCH"; do
+        sleep 1
+        BRANCH="checkpoint/$(date +%Y%m%d-%H%M%S)"
+    done
+
+    git switch -c "$BRANCH" >/dev/null
+fi
+
+# Custom message:
+#   checkpoint "my message"
+#
+# Default message:
+#   derive "Step 9K.1" from IMPLEMENTATION.md
+if [[ $# -gt 0 ]]; then
+    MESSAGE="$*"
+else
+    MESSAGE=""
+
+    if [[ -f IMPLEMENTATION.md ]]; then
+        MESSAGE=$(
+            sed -nE 's/^# (Step [^ ]+).*/\1/p' IMPLEMENTATION.md \
+            | head -n 1
+        )
+    fi
+
+    if [[ -z "$MESSAGE" ]]; then
+        MESSAGE="Checkpoint $(date '+%Y-%m-%d %H:%M')"
+    fi
+fi
+
+git add -A
+
+if ! OUTPUT=$(git commit -m "$MESSAGE" 2>&1); then
+    echo "$OUTPUT"
+    exit 1
+fi
+
+if ! OUTPUT=$(git push -u origin "$BRANCH" 2>&1); then
+    echo "$OUTPUT"
+    exit 1
+fi
+
+echo "Branch: $BRANCH"
+echo "Commit: $(git log -1 --oneline)"

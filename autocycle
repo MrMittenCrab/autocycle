@@ -1,0 +1,1161 @@
+#!/bin/bash
+set -euo pipefail
+# AUTOCYCLE_COMPACT_STAGES_V1
+
+# autocycle live instruction queue v1
+QUEUE_HELPER="$HOME/.autocycle/instructions.py"
+case "${1:-}" in
+    --instruct|--instructions|--cancel-instruction)
+        exec python3 "$QUEUE_HELPER" -- "$@"
+        ;;
+esac
+
+# Keep the Mac awake for the lifetime of autocycle.
+# The display may still turn off.
+if [[ "${1:-}" != "--stop" && "$(uname -s)" == "Darwin" && "${AUTOCYCLE_CAFFEINATED:-0}" != "1" ]]; then
+    exec caffeinate -i -s env AUTOCYCLE_CAFFEINATED=1 "$0" "$@"
+fi
+
+ENGINE="$HOME/.autocycle/stage"
+
+usage() {
+    echo "Usage:"
+    echo "  autocycle <cycles>"
+    echo "  autocycle <cycles> --dry-run"
+    echo "  autocycle --review-only"
+    echo "  autocycle --plan-only"
+    echo "  autocycle --implement-only"
+    echo "  autocycle --stop    # pause after the current stage"
+    echo '  autocycle --instruct "text"'
+    echo "  autocycle --instructions"
+    echo "  autocycle --cancel-instruction <id>"
+    exit 1
+}
+
+fail() {
+    echo
+    echo "FAILED: $1"
+    exit 1
+}
+
+# ============================================================
+# Network / VPN recovery
+# ============================================================
+
+VPN_SERVICE="${AUTOCYCLE_VPN_SERVICE:-VPN cat}"
+VPN_BUNDLE_ID="${AUTOCYCLE_VPN_BUNDLE_ID:-com.vpn.cat}"
+NETWORK_TIMEOUT="${AUTOCYCLE_NETWORK_TIMEOUT:-600}"
+
+country_allowed() {
+    case "${1:-}" in
+        US|GB|UK|FR)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+internet_up() {
+    curl -4fsS \
+        --connect-timeout 5 \
+        --max-time 8 \
+        https://github.com/ \
+        >/dev/null 2>&1
+}
+
+vpn_connected() {
+    local STATUS
+
+    STATUS=$(
+        scutil --nc status "$VPN_SERVICE" 2>/dev/null \
+            | head -n 1 \
+            || true
+    )
+
+    [[ "$STATUS" == "Connected" ]]
+}
+
+exit_country() {
+    local COUNTRY
+    local BODY
+
+    COUNTRY=$(
+        curl -4fsS \
+            --connect-timeout 5 \
+            --max-time 8 \
+            https://ipinfo.io/country \
+            2>/dev/null \
+        | tr -d '[:space:]' \
+        | tr '[:lower:]' '[:upper:]' \
+        || true
+    )
+
+    if [[ "$COUNTRY" =~ ^[A-Z]{2}$ ]]; then
+        echo "$COUNTRY"
+        return 0
+    fi
+
+    COUNTRY=$(
+        curl -4fsS \
+            --connect-timeout 5 \
+            --max-time 8 \
+            https://ifconfig.co/country-iso \
+            2>/dev/null \
+        | tr -d '[:space:]' \
+        | tr '[:lower:]' '[:upper:]' \
+        || true
+    )
+
+    if [[ "$COUNTRY" =~ ^[A-Z]{2}$ ]]; then
+        echo "$COUNTRY"
+        return 0
+    fi
+
+    BODY=$(
+        curl -4fsS \
+            --connect-timeout 5 \
+            --max-time 8 \
+            https://api.country.is/ \
+            2>/dev/null \
+        || true
+    )
+
+    COUNTRY=$(
+        printf '%s' "$BODY" \
+        | sed -nE \
+          's/.*"country"[[:space:]]*:[[:space:]]*"([A-Za-z]{2})".*/\1/p' \
+        | tr '[:lower:]' '[:upper:]'
+    )
+
+    if [[ "$COUNTRY" =~ ^[A-Z]{2}$ ]]; then
+        echo "$COUNTRY"
+        return 0
+    fi
+
+    return 1
+}
+
+network_ready() {
+    local COUNTRY
+
+    internet_up || return 1
+    vpn_connected || return 1
+
+    COUNTRY=$(exit_country) || return 1
+    country_allowed "$COUNTRY" || return 1
+
+    return 0
+}
+
+wifi_device() {
+    networksetup -listallhardwareports 2>/dev/null \
+    | awk '
+        /^Hardware Port: (Wi-Fi|AirPort)$/ {
+            getline
+            sub(/^Device: /, "")
+            print
+            exit
+        }
+    '
+}
+
+restart_wifi() {
+    local DEVICE
+
+    DEVICE=$(wifi_device)
+    [[ -n "$DEVICE" ]] || return 1
+
+    networksetup -setairportpower "$DEVICE" off \
+        >/dev/null 2>&1 || true
+
+    sleep 2
+
+    networksetup -setairportpower "$DEVICE" on \
+        >/dev/null 2>&1 || return 1
+
+    sleep 8
+}
+
+restart_vpn() {
+    # Launch VPN Cat in the background if necessary.
+    open -g -j -b "$VPN_BUNDLE_ID" \
+        >/dev/null 2>&1 || true
+
+    scutil --nc stop "$VPN_SERVICE" \
+        >/dev/null 2>&1 || true
+
+    sleep 2
+
+    scutil --nc start "$VPN_SERVICE" \
+        >/dev/null 2>&1 || true
+
+    sleep 8
+}
+
+network_recover() {
+    local START
+    local NOW
+    local ELAPSED
+    local COUNTRY
+
+    START=$(date +%s)
+
+    while true; do
+        NOW=$(date +%s)
+        ELAPSED=$((NOW - START))
+
+        if (( ELAPSED >= NETWORK_TIMEOUT )); then
+            if [[ -t 1 ]]; then
+                printf "\r\033[2K"
+            fi
+
+            echo "Network     ✗ ${ELAPSED}s"
+            return 1
+        fi
+
+        # Temporary status line only.
+        if [[ -t 1 ]]; then
+            printf "\rNetwork     ↻ %02d:%02d" \
+                "$((ELAPSED / 60))" \
+                "$((ELAPSED % 60))"
+        fi
+
+        # Temporarily remove the tunnel so underlying connectivity
+        # can be diagnosed independently.
+        scutil --nc stop "$VPN_SERVICE" \
+            >/dev/null 2>&1 || true
+
+        sleep 2
+
+        if ! internet_up; then
+            restart_wifi || true
+        fi
+
+        if internet_up; then
+            restart_vpn
+        fi
+
+        if network_ready; then
+            COUNTRY=$(exit_country || true)
+
+            if [[ -t 1 ]]; then
+                # Brief success confirmation, then erase the line so
+                # Network does not remain in the final cycle output.
+                printf "\r\033[2KNetwork     ✓ %s" "${COUNTRY:-VPN}"
+                sleep 1
+                printf "\r\033[2K"
+            else
+                echo "Network     ✓ ${COUNTRY:-VPN}"
+            fi
+
+            return 0
+        fi
+
+        sleep 3
+    done
+}
+
+ensure_network() {
+    if network_ready; then
+        return 0
+    fi
+
+    network_recover
+}
+
+run_engine_stage() {
+    local MODE="$1"
+    local ALLOW_DIRTY="${2:-0}"
+    local RC
+
+    if AUTOCYCLE_INPUT_BATCH="${INPUT_CYCLE_ID:-}" AUTOCYCLE_INPUT_KEY="${INPUT_KEY:-}" \
+       AUTOCYCLE_ALLOW_DIRTY="$ALLOW_DIRTY" "$ENGINE" "$MODE"; then
+        RC=0
+    else
+        RC=$?
+    fi
+
+    if [[ "$RC" -eq 0 ]]; then
+        return 0
+    fi
+
+    # Retry automatically only when connectivity is actually broken.
+    if ! network_ready; then
+        network_recover || return "$RC"
+
+        # Signal the durable state machine to retry this same boundary.
+        return 75
+    fi
+
+    return "$RC"
+}
+
+[[ -x "$ENGINE" ]] || fail "internal autocycle engine missing: $ENGINE"
+
+MODE="run"
+MAX_CYCLES=1
+
+if [[ $# -eq 1 ]]; then
+    if [[ "$1" =~ ^[1-9][0-9]*$ ]]; then
+        MAX_CYCLES="$1"
+    else
+        MODE="$1"
+    fi
+elif [[ $# -eq 2 ]]; then
+    [[ "$1" =~ ^[1-9][0-9]*$ ]] || usage
+    MAX_CYCLES="$1"
+    MODE="$2"
+else
+    usage
+fi
+
+case "$MODE" in
+    run|--dry-run|--review-only|--plan-only|--implement-only|--stop) ;;
+    *) usage ;;
+esac
+
+ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || fail "not inside a Git repository."
+cd "$ROOT"
+
+GIT_DIR=$(git rev-parse --git-dir)
+
+if [[ "$GIT_DIR" = /* ]]; then
+    AC_DIR="$GIT_DIR/autocycle"
+else
+    AC_DIR="$ROOT/$GIT_DIR/autocycle"
+fi
+
+mkdir -p "$AC_DIR"
+
+# autocycle resume and pause v1
+STOP_REQUEST="$AC_DIR/stop-request"
+
+if [[ "$MODE" == "--stop" ]]; then
+    # mkdir is an atomic, idempotent request; no network or signals required.
+    mkdir -p "$STOP_REQUEST"
+    echo "Stop requested. Autocycle will pause after its current stage saves state."
+    exit 0
+fi
+
+pause_if_requested() {
+    if [[ -d "$STOP_REQUEST" ]]; then
+        rmdir "$STOP_REQUEST" || fail "could not consume stop request."
+        echo
+        echo "Paused. Saved state and working files preserved."
+        echo "Resume by rerunning your original autocycle command."
+        exit 0
+    fi
+}
+
+
+# The descriptor stays open in the controller and its children. A competing
+# controller fails immediately; instruction submission uses only SQLite locks.
+if [[ "$MODE" != "--dry-run" ]]; then
+    exec 9>"$AC_DIR/controller.lock"
+    python3 "$QUEUE_HELPER" lock 9 || fail "another controller is running or its lock is unavailable."
+fi
+
+input_queue() {
+    python3 "$QUEUE_HELPER" --dir "$AC_DIR" "$@"
+}
+
+prepare_cycle_input() {
+    if [[ -z "${INPUT_CYCLE_ID:-}" ]]; then
+        INPUT_CYCLE_ID=$(input_queue new-id) || fail "could not create cycle input ID."
+        save_state
+    fi
+    INPUT_COUNT=$(input_queue freeze "$INPUT_CYCLE_ID" "$(branch)" "$(head_sha)" "$INPUT_ALLOW_NEW") \
+        || fail "could not freeze cycle input; existing state preserved."
+    INPUT_KEY=""
+    if (( INPUT_COUNT > 0 )); then
+        INPUT_KEY="$INPUT_CYCLE_ID"
+        if [[ "${INPUT_PRINTED:-}" != "$INPUT_CYCLE_ID" ]]; then
+            if [[ "$INPUT_COUNT" == 1 ]]; then
+                echo "Input       ✓ 1 instruction"
+            else
+                echo "Input       ✓ $INPUT_COUNT instructions"
+            fi
+            INPUT_PRINTED="$INPUT_CYCLE_ID"
+        fi
+    fi
+}
+
+STATE="$AC_DIR/resume-state"
+CACHE="$AC_DIR/current-review"
+
+RUN_MAX="$MAX_CYCLES"
+RUN_CYCLE=1
+STAGE="start"
+PLAN_SHA=""
+IMPLEMENT_BASE_SHA=""
+STATE_BRANCH=""
+INPUT_CYCLE_ID=""
+INPUT_ALLOW_NEW=0
+INPUT_KEY=""
+
+save_state() {
+    local TMP="$STATE.tmp.$$"
+
+    {
+        printf 'STATE_VERSION=%q\n' "1"
+        printf 'RUN_MAX=%q\n' "$RUN_MAX"
+        printf 'RUN_CYCLE=%q\n' "$RUN_CYCLE"
+        printf 'STAGE=%q\n' "$STAGE"
+        printf 'PLAN_SHA=%q\n' "$PLAN_SHA"
+        printf 'IMPLEMENT_BASE_SHA=%q\n' "${IMPLEMENT_BASE_SHA:-}"
+        printf 'STATE_BRANCH=%q\n' "$STATE_BRANCH"
+        printf 'INPUT_CYCLE_ID=%q\n' "${INPUT_CYCLE_ID:-}"
+        printf 'INPUT_ALLOW_NEW=%q\n' "${INPUT_ALLOW_NEW:-0}"
+    } > "$TMP"
+
+    mv "$TMP" "$STATE"
+}
+
+load_state() {
+    [[ -f "$STATE" ]] || return 1
+
+    # shellcheck disable=SC1090
+    source "$STATE"
+
+    [[ "${STATE_VERSION:-}" == "1" ]]
+}
+
+clear_state() {
+    if [[ -n "${INPUT_CYCLE_ID:-}" ]]; then
+        input_queue close-empty "$INPUT_CYCLE_ID" || fail "active human input cannot be discarded."
+    fi
+    rm -f "$STATE"
+}
+
+branch() {
+    git branch --show-current
+}
+
+# ownership guard v1
+assert_owned_docs() {
+    local OWNERSHIP_BASE="${1:-HEAD}"
+    if ! python3 - "$OWNERSHIP_BASE" <<'OWNERSHIP_PY'
+import os, stat, subprocess, sys
+from pathlib import Path
+
+def git(*args):
+    return subprocess.check_output(['git', *args])
+try:
+    baseline = git('rev-parse', '--verify', sys.argv[1] + '^{commit}').strip().decode()
+    root = Path(os.fsdecode(git('rev-parse', '--show-toplevel').rstrip(b'\n')))
+    for name in ('TARGET.md', 'IMPLEMENTATION.md'):
+        tree = git('ls-tree', '-z', baseline, '--', name)
+        index = git('ls-files', '--stage', '-z', '--', name)
+        path = root / name
+        if not tree:
+            if index or os.path.lexists(path):
+                raise RuntimeError(name + ' was added outside Plan')
+            continue
+        mode, kind, oid = tree.split(b'\t', 1)[0].split()
+        if kind != b'blob' or mode not in (b'100644', b'100755'):
+            raise RuntimeError(name + ' must be a regular tracked file')
+        expected_index = mode + b' ' + oid + b' 0\t' + name.encode() + b'\0'
+        if index != expected_index:
+            raise RuntimeError(name + ' differs in the Git index')
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode):
+            raise RuntimeError(name + ' is no longer a regular file')
+        executable = bool(info.st_mode & stat.S_IXUSR)
+        if executable != (mode == b'100755') or path.read_bytes() != git('cat-file', 'blob', oid.decode()):
+            raise RuntimeError(name + ' differs from the synced plan')
+except Exception as error:
+    print('Ownership check: ' + str(error), file=sys.stderr)
+    sys.exit(1)
+OWNERSHIP_PY
+    then
+        fail "protected plan/target changed or could not be verified; work preserved."
+    fi
+}
+# end ownership guard
+
+head_sha() {
+    git rev-parse HEAD
+}
+
+head_subject() {
+    git log -1 --pretty=%s
+}
+
+dirty() {
+    [[ -n "$(git status --porcelain)" ]]
+}
+
+fetch_remote() {
+    local RC
+
+    set +e
+    git fetch --prune origin >/dev/null 2>&1
+    RC=$?
+    set -e
+
+    if [[ "$RC" -eq 0 ]]; then
+        return 0
+    fi
+
+    if ! network_ready; then
+        network_recover             || fail "network recovery failed while fetching origin."
+
+        git fetch --prune origin >/dev/null 2>&1             || fail "could not fetch origin after network recovery."
+
+        return 0
+    fi
+
+    fail "could not fetch origin."
+}
+
+remote_sha() {
+    git rev-parse "origin/$(branch)" 2>/dev/null || true
+}
+
+is_plan_head() {
+    [[ "$(head_subject)" == "Plan: "* ]]
+}
+
+remote_plan_child_of_head() {
+    local R P S
+
+    R=$(remote_sha)
+
+    [[ -n "$R" && "$R" != "$(head_sha)" ]] || return 1
+
+    P=$(git rev-parse "$R^" 2>/dev/null || true)
+    S=$(git log -1 --pretty=%s "$R" 2>/dev/null || true)
+
+    [[ "$P" == "$(head_sha)" && "$S" == "Plan: "* ]] || return 1
+    if [[ -n "${INPUT_KEY:-}" ]]; then
+        input_queue matches-plan "$INPUT_KEY" "$R" || return 1
+    fi
+}
+
+recover_review_cache_from_logs() {
+    local H B LOG STATUS_VALUE REVIEW_VALUE NEXT_VALUE REVIEW_SHA
+
+    H=$(head_sha)
+    B=$(branch)
+
+    while IFS= read -r LOG; do
+        [[ -n "$LOG" ]] || continue
+
+        STATUS_VALUE=$(
+            grep '^REVIEW_STATUS:' "$LOG" |
+            tail -n 1 |
+            sed 's/^REVIEW_STATUS: //' ||
+            true
+        )
+
+        case "$STATUS_VALUE" in
+            PASS|PROBLEMS|DONE|BLOCKED) ;;
+            *) continue ;;
+        esac
+
+        REVIEW_VALUE=$(
+            grep '^REVIEW:' "$LOG" |
+            tail -n 1 |
+            sed 's/^REVIEW: //' ||
+            true
+        )
+
+        NEXT_VALUE=$(
+            grep '^NEXT_STEP:' "$LOG" |
+            tail -n 1 |
+            sed 's/^NEXT_STEP: //' ||
+            true
+        )
+
+        REVIEW_SHA=$(
+            grep '^REVIEWED_SHA:' "$LOG" |
+            tail -n 1 |
+            sed 's/^REVIEWED_SHA: //' ||
+            true
+        )
+
+        [[ "$REVIEW_SHA" == "$H" ]] || continue
+        [[ "$(sed -n 's/^AUTOCYCLE_REVIEW_INPUT: //p' "$LOG" | tail -n 1)" == "${INPUT_KEY:-}" ]] || continue
+        [[ -n "$REVIEW_VALUE" ]] || continue
+        [[ -n "$NEXT_VALUE" ]] || continue
+
+        {
+            echo "CACHE_BRANCH: $B"
+            echo "INPUT_BATCH: ${INPUT_KEY:-}"
+            echo "REVIEW_STATUS: $STATUS_VALUE"
+            echo "REVIEW: $REVIEW_VALUE"
+            echo "NEXT_STEP: $NEXT_VALUE"
+            echo "REVIEWED_SHA: $REVIEW_SHA"
+        } > "$CACHE"
+
+        return 0
+
+    done < <(
+        ls -1t "$AC_DIR"/review-*.log 2>/dev/null || true
+    )
+
+    return 1
+}
+
+review_cache_matches_head() {
+    local CACHED_BRANCH
+    local CACHED_STATUS
+    local CACHED_SHA
+
+    if [[ ! -f "$CACHE" ]]; then
+        recover_review_cache_from_logs || return 1
+    fi
+
+    CACHED_BRANCH=$(
+        grep '^CACHE_BRANCH:' "$CACHE" |
+        tail -n 1 |
+        sed 's/^CACHE_BRANCH: //' ||
+        true
+    )
+
+    CACHED_STATUS=$(
+        grep '^REVIEW_STATUS:' "$CACHE" |
+        tail -n 1 |
+        sed 's/^REVIEW_STATUS: //' ||
+        true
+    )
+
+    CACHED_SHA=$(
+        grep '^REVIEWED_SHA:' "$CACHE" |
+        tail -n 1 |
+        sed 's/^REVIEWED_SHA: //' ||
+        true
+    )
+
+    if [[ "$CACHED_BRANCH" != "$(branch)" ||
+          "$CACHED_SHA" != "$(head_sha)" ]]; then
+
+        rm -f "$CACHE"
+
+        recover_review_cache_from_logs || return 1
+
+        CACHED_BRANCH=$(
+            grep '^CACHE_BRANCH:' "$CACHE" |
+            tail -n 1 |
+            sed 's/^CACHE_BRANCH: //' ||
+            true
+        )
+
+        CACHED_STATUS=$(
+            grep '^REVIEW_STATUS:' "$CACHE" |
+            tail -n 1 |
+            sed 's/^REVIEW_STATUS: //' ||
+            true
+        )
+
+        CACHED_SHA=$(
+            grep '^REVIEWED_SHA:' "$CACHE" |
+            tail -n 1 |
+            sed 's/^REVIEWED_SHA: //' ||
+            true
+        )
+    fi
+
+    case "$CACHED_STATUS" in
+        PASS|PROBLEMS|DONE|BLOCKED) ;;
+        *) return 1 ;;
+    esac
+
+    [[ "$CACHED_BRANCH" == "$(branch)" ]] || return 1
+    [[ "$(sed -n 's/^INPUT_BATCH: //p' "$CACHE" | tail -n 1)" == "${INPUT_KEY:-}" ]] || return 1
+    [[ "$CACHED_SHA" == "$(head_sha)" ]]
+}
+
+review_summary() {
+    [[ -f "$CACHE" ]] || return 0
+
+    grep '^REVIEW:' "$CACHE" \
+        | tail -n 1 \
+        | sed 's/^REVIEW: /    Found: /' \
+        || true
+}
+
+plan_title_from_sha() {
+    local S="$1"
+
+    git log -1 --pretty=%s "$S" 2>/dev/null \
+        | sed 's/^Plan: //'
+}
+
+infer_state() {
+    fetch_remote
+
+    STATE_BRANCH=$(branch)
+
+    [[ -n "$STATE_BRANCH" ]] || fail "detached HEAD."
+
+    # Reuse a completed review.
+    if review_cache_matches_head \
+        && ! dirty \
+        && [[ "$(remote_sha)" == "$(head_sha)" ]]; then
+
+        STAGE="review_done"
+        save_state
+        return
+    fi
+
+    # Plan was pushed but local sync did not happen.
+    if ! dirty && remote_plan_child_of_head; then
+        PLAN_SHA=$(remote_sha)
+        STAGE="plan_done"
+        save_state
+        return
+    fi
+
+    # Local HEAD is already the planning commit.
+    # Clean = implementation has not started.
+    # Dirty = implementation was interrupted or already partially/completely done.
+    #
+    # In both cases we safely rerun the same implementation step.
+    if is_plan_head && [[ "$(remote_sha)" == "$(head_sha)" ]]; then
+        PLAN_SHA=$(head_sha)
+        STAGE="implementing"
+        save_state
+        return
+    fi
+
+    if dirty; then
+        git status --short
+        fail "dirty tree is not based on a recognized Plan commit."
+    fi
+
+    [[ "$(remote_sha)" == "$(head_sha)" ]] \
+        || fail "local branch and GitHub are not synchronized."
+
+    STAGE="start"
+    save_state
+}
+
+if [[ "$MODE" != "--dry-run" ]]; then
+    pause_if_requested
+    ensure_network || fail "network/VPN preflight failed."
+fi
+
+# ------------------------------------------------------------
+# Dry run
+# ------------------------------------------------------------
+
+if [[ "$MODE" == "--dry-run" ]]; then
+    exec "$ENGINE" "$MAX_CYCLES" --dry-run
+fi
+
+# ------------------------------------------------------------
+# Manual stages
+# ------------------------------------------------------------
+if [[ "$MODE" == "--review-only" || "$MODE" == "--plan-only" || "$MODE" == "--implement-only" ]]; then
+    input_queue guard-manual || fail "resume the active instruction cycle with autocycle N."
+fi
+
+if [[ "$MODE" == "--review-only" ]]; then
+    "$ENGINE" --review-only
+
+    RUN_MAX=1
+    RUN_CYCLE=1
+    STAGE="review_done"
+    PLAN_SHA=""
+    STATE_BRANCH=$(branch)
+
+    save_state
+    pause_if_requested
+    exit 0
+fi
+
+if [[ "$MODE" == "--plan-only" ]]; then
+    "$ENGINE" --plan-only
+
+    fetch_remote
+
+    RUN_MAX=1
+    RUN_CYCLE=1
+    STAGE="plan_done"
+    PLAN_SHA=$(remote_sha)
+    STATE_BRANCH=$(branch)
+
+    save_state
+    pause_if_requested
+    exit 0
+fi
+
+if [[ "$MODE" == "--implement-only" ]]; then
+    IMPLEMENT_BASE_SHA=$(head_sha)
+    AUTOCYCLE_ALLOW_DIRTY=1 "$ENGINE" --implement-only
+    [[ "$(head_sha)" == "$IMPLEMENT_BASE_SHA" ]] || fail "implementation changed HEAD."
+    assert_owned_docs "$IMPLEMENT_BASE_SHA"
+
+    RUN_MAX=1
+    RUN_CYCLE=1
+    if dirty; then STAGE="implement_done"; else STAGE="implement_nochange"; fi
+    PLAN_SHA="$IMPLEMENT_BASE_SHA"
+    STATE_BRANCH=$(branch)
+    save_state
+    pause_if_requested
+    exit 0
+fi
+
+# ------------------------------------------------------------
+# Load or infer resumable state
+# ------------------------------------------------------------
+
+if load_state; then
+    [[ "$RUN_MAX" == "$MAX_CYCLES" ]] \
+        || fail "unfinished run expects $RUN_MAX cycles; rerun: autocycle $RUN_MAX"
+
+    CURRENT_BRANCH=$(branch)
+
+    if [[ -n "${STATE_BRANCH:-}" &&
+          "$STATE_BRANCH" != "$CURRENT_BRANCH" ]]; then
+
+        fail "resume state belongs to $STATE_BRANCH, but current branch is $CURRENT_BRANCH."
+    fi
+else
+    infer_state
+    # Only a genuinely new cycle may acquire pending input. Existing exported
+    # states and inferred in-flight plans remain frozen without new input.
+    if [[ "$STAGE" == "start" ]]; then
+        INPUT_ALLOW_NEW=1
+    fi
+    save_state
+fi
+
+LAST_PRINTED_CYCLE=0
+
+while (( RUN_CYCLE <= RUN_MAX )); do
+
+    pause_if_requested
+    [[ -z "${STATE_BRANCH:-}" || "$(branch)" == "$STATE_BRANCH" ]] || fail "resume branch changed; state preserved."
+
+    if [[ "$LAST_PRINTED_CYCLE" != "$RUN_CYCLE" ]]; then
+        echo
+        echo "Cycle       $RUN_CYCLE/$RUN_MAX"
+        echo
+
+        LAST_PRINTED_CYCLE="$RUN_CYCLE"
+    fi
+
+    if [[ "$STAGE" != "checkpoint_done" ]]; then
+        prepare_cycle_input
+    fi
+
+    fetch_remote
+
+    # --------------------------------------------------------
+    # Recover if review actually finished before interruption
+    # --------------------------------------------------------
+
+    if [[ "$STAGE" == "reviewing" ]] && review_cache_matches_head; then
+        STAGE="review_done"
+        save_state
+    fi
+
+    # --------------------------------------------------------
+    # Recover if planning actually pushed before interruption
+    # --------------------------------------------------------
+
+    if [[ "$STAGE" == "planning" ]] \
+        && ! dirty \
+        && remote_plan_child_of_head; then
+
+        PLAN_SHA=$(remote_sha)
+        STAGE="plan_done"
+        save_state
+    fi
+
+    # --------------------------------------------------------
+    # Recover if checkpoint committed before interruption
+    # --------------------------------------------------------
+
+    if [[ "$STAGE" == "implement_done" ]]; then
+        [[ -n "${PLAN_SHA:-}" ]] || fail "missing plan baseline; cannot verify ownership."
+        assert_owned_docs "${IMPLEMENT_BASE_SHA:-$PLAN_SHA}"
+        CURRENT=$(head_sha)
+
+        if [[ -z "$(git status --porcelain)" \
+            && -n "$PLAN_SHA" \
+            && "$CURRENT" != "$PLAN_SHA" ]] \
+            && git merge-base --is-ancestor "$PLAN_SHA" "$CURRENT" 2>/dev/null; then
+
+            CURRENT_BRANCH=$(branch)
+
+            if [[ "$(git rev-parse "origin/$CURRENT_BRANCH" 2>/dev/null || true)" != "$CURRENT" ]]; then
+                git push -u origin "$CURRENT_BRANCH" >/dev/null 2>&1 \
+                    || fail "could not resume checkpoint push."
+
+                fetch_remote
+            fi
+
+            STAGE="checkpoint_done"
+            STATE_BRANCH="$CURRENT_BRANCH"
+
+            save_state
+        fi
+    fi
+
+    case "$STAGE" in
+
+        reviewing)
+            # Interrupted review with no completed cache:
+            # rerun review, not the whole cycle.
+            STAGE="start"
+            save_state
+            continue
+            ;;
+
+        planning)
+            # Preserve a completed review when planning was interrupted.
+            if review_cache_matches_head; then
+                STAGE="review_done"
+            else
+                STAGE="start"
+            fi
+
+            save_state
+            continue
+            ;;
+
+        start)
+            STAGE="reviewing"
+            STATE_BRANCH=$(branch)
+            save_state
+
+            set +e
+            run_engine_stage --review-only 0
+            RC=$?
+            set -e
+
+            if [[ "$RC" -eq 75 ]]; then
+                continue
+            fi
+
+            [[ "$RC" -eq 0 ]]                 || fail "review stage."
+
+            STAGE="review_done"
+            save_state
+
+            JUST_COMPLETED_REVIEW=1
+            continue
+            ;;
+
+        review_done)
+            if [[ -n "${INPUT_KEY:-}" ]] && ! review_cache_matches_head; then
+                STAGE="start"
+                save_state
+                continue
+            fi
+            if [[ "${JUST_COMPLETED_REVIEW:-0}" == "1" ]]; then
+                JUST_COMPLETED_REVIEW=0
+            elif review_cache_matches_head; then
+                echo "Review      ✓ resumed"
+                review_summary
+            fi
+
+            REVIEW_STATUS_VALUE=$(
+                grep '^REVIEW_STATUS:' "$CACHE" |
+                tail -n 1 |
+                sed 's/^REVIEW_STATUS: //' ||
+                true
+            )
+
+            if [[ "$REVIEW_STATUS_VALUE" == "DONE" ]]; then
+                if [[ -n "${INPUT_KEY:-}" ]]; then
+                    echo "BLOCKED: active human instructions require a published plan; input retained."
+                    exit 2
+                fi
+                clear_state
+                exit 0
+            fi
+
+            if [[ "$REVIEW_STATUS_VALUE" == "BLOCKED" ]]; then
+                echo
+                echo "BLOCKED"
+                review_summary
+                exit 2
+            fi
+
+            STAGE="planning"
+            save_state
+
+            set +e
+            run_engine_stage --plan-only 0
+            RC=$?
+            set -e
+
+            if [[ "$RC" -eq 75 ]]; then
+                continue
+            fi
+
+            [[ "$RC" -eq 0 ]]                 || fail "planning stage."
+
+            fetch_remote
+
+            PLAN_SHA=$(remote_sha)
+            STAGE="plan_done"
+
+            save_state
+
+            JUST_COMPLETED_PLAN=1
+            continue
+            ;;
+
+        plan_done)
+            if [[ -n "${INPUT_KEY:-}" ]]; then
+                input_queue published "$INPUT_KEY" "$PLAN_SHA" || fail "cannot bind input to the published plan."
+            fi
+            TITLE=$(plan_title_from_sha "$PLAN_SHA")
+
+            if [[ "${JUST_COMPLETED_PLAN:-0}" == "1" ]]; then
+                JUST_COMPLETED_PLAN=0
+
+            elif [[ "$(head_sha)" != "$PLAN_SHA" ]]; then
+                echo "Plan        ✓ resumed"
+                echo "    Planned: $TITLE"
+            fi
+
+            if ! OUT=$(sync 2>&1); then
+                if ! network_ready; then
+                    network_recover                         || fail "network recovery failed during sync."
+                    continue
+                fi
+
+                echo "$OUT"
+                fail "sync"
+            fi
+
+            [[ "$(head_sha)" == "$PLAN_SHA" ]] \
+                || fail "sync did not reach the planned commit."
+
+            STAGE="implementing"
+            save_state
+
+            echo "Sync        ✓ $(git rev-parse --short HEAD)"
+
+            continue
+            ;;
+
+        implementing)
+            # Pin ownership to the HEAD actually being verified, including legacy
+            # resumes whose completed work was already checkpointed manually.
+            if [[ -z "${IMPLEMENT_BASE_SHA:-}" ]]; then
+                IMPLEMENT_BASE_SHA=$(head_sha)
+                [[ -n "${PLAN_SHA:-}" ]] || fail "missing plan baseline."
+                git merge-base --is-ancestor "$PLAN_SHA" "$IMPLEMENT_BASE_SHA" || fail "implementation is not descended from its plan."
+                save_state
+            fi
+            [[ "$(head_sha)" == "$IMPLEMENT_BASE_SHA" ]] || fail "HEAD changed since implementation began."
+            assert_owned_docs "$IMPLEMENT_BASE_SHA"
+            # Dirty working trees are deliberately allowed here.
+            # Cursor sees the existing changes, preserves correct work,
+            # and finishes/verifies the same IMPLEMENTATION.md step.
+            set +e
+            run_engine_stage --implement-only 1
+            RC=$?
+            set -e
+
+            if [[ "$RC" -eq 75 ]]; then
+                continue
+            fi
+
+            [[ "$RC" -eq 0 ]]                 || fail "implementation stage."
+
+            [[ "$(head_sha)" == "$IMPLEMENT_BASE_SHA" ]] || fail "implementation changed HEAD."
+            assert_owned_docs "$IMPLEMENT_BASE_SHA"
+            if dirty; then
+                STAGE="implement_done"
+            else
+                STAGE="implement_nochange"
+            fi
+
+            PLAN_SHA=${PLAN_SHA:-$(head_sha)}
+            STATE_BRANCH=$(branch)
+
+            save_state
+            continue
+            ;;
+
+        implement_nochange)
+            [[ -n "${IMPLEMENT_BASE_SHA:-}" ]] || fail "missing no-change verification baseline."
+            [[ "$(head_sha)" == "$IMPLEMENT_BASE_SHA" ]] || fail "HEAD changed after no-change verification."
+            ! dirty || fail "working files changed after no-change verification; state preserved."
+            assert_owned_docs "$IMPLEMENT_BASE_SHA"
+            [[ "$(remote_sha)" == "$IMPLEMENT_BASE_SHA" ]] || fail "no-change HEAD differs from GitHub; state preserved."
+            rm -f "$CACHE"
+            STAGE="checkpoint_done"
+            save_state
+            echo "Checkpoint  – skipped (no changes; proceeding to Review)"
+            continue
+            ;;
+
+        implement_done)
+            [[ -n "${PLAN_SHA:-}" ]] || fail "missing plan baseline; cannot verify ownership."
+            assert_owned_docs "${IMPLEMENT_BASE_SHA:-$PLAN_SHA}"
+            BEFORE=$(head_sha)
+
+            if ! OUT=$(checkpoint 2>&1); then
+                if ! network_ready; then
+                    network_recover                         || fail "network recovery failed during checkpoint."
+                    continue
+                fi
+
+                echo "$OUT"
+                fail "checkpoint"
+            fi
+
+            AFTER=$(head_sha)
+
+            if [[ "$AFTER" == "$BEFORE" ]]; then
+                [[ -n "$PLAN_SHA" && "$AFTER" != "$PLAN_SHA" ]] \
+                    || fail "checkpoint created no implementation commit."
+            fi
+
+            CURRENT_BRANCH=$(branch)
+
+            fetch_remote
+
+            [[ "$(git rev-parse "origin/$CURRENT_BRANCH" 2>/dev/null || true)" == "$AFTER" ]] \
+                || fail "checkpoint is not on GitHub."
+
+            STAGE="checkpoint_done"
+            STATE_BRANCH="$CURRENT_BRANCH"
+
+            save_state
+
+            echo "Checkpoint  ✓ $(git rev-parse --short HEAD)"
+            continue
+            ;;
+
+        checkpoint_done)
+            if [[ -n "${INPUT_CYCLE_ID:-}" ]]; then
+                input_queue complete "$INPUT_CYCLE_ID" "$(head_sha)" || fail "input archival failed; state preserved."
+            fi
+            if (( RUN_CYCLE >= RUN_MAX )); then
+                clear_state
+                exit 0
+            fi
+
+            RUN_CYCLE=$((RUN_CYCLE + 1))
+            INPUT_CYCLE_ID=""
+            INPUT_ALLOW_NEW=1
+            INPUT_KEY=""
+
+            STAGE="start"
+            PLAN_SHA=""
+            IMPLEMENT_BASE_SHA=""
+            STATE_BRANCH=$(branch)
+
+            rm -f "$CACHE"
+
+            save_state
+            continue
+            ;;
+
+        *)
+            fail "unknown resume stage: $STAGE"
+            ;;
+    esac
+done

@@ -1,0 +1,1401 @@
+#!/bin/bash
+set -euo pipefail
+
+usage() {
+    echo "Usage:"
+    echo "  autocycle <cycles>"
+    echo "  autocycle <cycles> --dry-run"
+    echo "  autocycle --review-only"
+    echo "  autocycle --plan-only"
+    echo "  autocycle --implement-only"
+    exit 1
+}
+
+LIVE_TIMER_PID=""
+LIVE_TIMER_LABEL=""
+LIVE_TIMER_START=0
+
+# AUTOCYCLE_TIMER_CLEANUP_V1
+live_stop_timer() {
+    if [[ -n "${LIVE_TIMER_PID:-}" ]]; then
+        kill "$LIVE_TIMER_PID" >/dev/null 2>&1 || true
+        wait "$LIVE_TIMER_PID" >/dev/null 2>&1 || true
+        LIVE_TIMER_PID=""
+    fi
+}
+
+trap live_stop_timer EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+
+format_elapsed() {
+    local NOW="$1"
+    local START="$2"
+    local SECONDS_ELAPSED=$((NOW - START))
+
+    printf "%02d:%02d" \
+        "$((SECONDS_ELAPSED / 60))" \
+        "$((SECONDS_ELAPSED % 60))"
+}
+
+live_start() {
+    local LABEL="$1"
+    local TIMER_OWNER_PID="$$"
+
+    live_stop_timer
+
+    LIVE_TIMER_LABEL="$LABEL"
+    LIVE_TIMER_START=$(date +%s)
+
+    (
+        while kill -0 "$TIMER_OWNER_PID" 2>/dev/null; do
+            if [[ -t 1 ]]; then
+                NOW=$(date +%s)
+                TIME=$(format_elapsed "$NOW" "$LIVE_TIMER_START")
+
+                printf "\r%-12s%s" "$LABEL" "$TIME"
+            fi
+
+            sleep 1
+        done
+    ) &
+
+    LIVE_TIMER_PID=$!
+}
+
+live_finish() {
+    local SYMBOL="$1"
+    local SUMMARY="${2:-}"
+
+    if [[ -n "${LIVE_TIMER_PID:-}" ]]; then
+        kill "$LIVE_TIMER_PID" >/dev/null 2>&1 || true
+        wait "$LIVE_TIMER_PID" >/dev/null 2>&1 || true
+    fi
+
+    local NOW
+    local TIME
+
+    NOW=$(date +%s)
+    TIME=$(format_elapsed "$NOW" "$LIVE_TIMER_START")
+
+    if [[ -t 1 ]]; then
+        printf "\r\033[2K"
+    fi
+
+    printf "%-12s%s %s\n" \
+        "$LIVE_TIMER_LABEL" \
+        "$SYMBOL" \
+        "$TIME"
+
+    if [[ -n "$SUMMARY" ]]; then
+        echo "    $SUMMARY"
+    fi
+
+    LIVE_TIMER_PID=""
+    LIVE_TIMER_LABEL=""
+    LIVE_TIMER_START=0
+}
+
+live_done() {
+    live_finish "✓" "${1:-}"
+}
+
+live_fail() {
+    live_finish "✗"
+}
+
+fail() {
+    if [[ -n "${LIVE_TIMER_PID:-}" ]]; then
+        live_fail
+    fi
+
+    echo
+    echo "FAILED: $1"
+    exit 1
+}
+
+# ============================================================
+# Arguments
+# ============================================================
+
+MODE="--run"
+MAX_CYCLES=1
+
+if [[ $# -eq 1 ]]; then
+    if [[ "$1" =~ ^[1-9][0-9]*$ ]]; then
+        MAX_CYCLES="$1"
+    else
+        MODE="$1"
+    fi
+elif [[ $# -eq 2 ]]; then
+    MAX_CYCLES="$1"
+    MODE="$2"
+
+    if ! [[ "$MAX_CYCLES" =~ ^[1-9][0-9]*$ ]]; then
+        usage
+    fi
+elif [[ $# -gt 2 ]]; then
+    usage
+fi
+
+case "$MODE" in
+    --run|--dry-run|--review-only|--plan-only|--implement-only)
+        ;;
+    *)
+        usage
+        ;;
+esac
+
+# ============================================================
+# Repository
+# ============================================================
+
+ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || {
+    fail "not inside a Git repository."
+}
+
+cd "$ROOT"
+
+command -v git >/dev/null 2>&1 || fail "git not found."
+
+needs_codex=0
+needs_cursor=0
+
+case "$MODE" in
+    --run)
+        needs_codex=1
+        needs_cursor=1
+        ;;
+    --review-only|--plan-only)
+        needs_codex=1
+        ;;
+    --implement-only)
+        needs_cursor=1
+        ;;
+esac
+
+if [[ "$needs_codex" -eq 1 ]]; then
+    command -v codex >/dev/null 2>&1 || fail "codex not found."
+
+    AUTH=$(codex login status 2>&1 || true)
+
+    if [[ "$AUTH" != *"Logged in using ChatGPT"* ]]; then
+        fail "Codex is not authenticated using ChatGPT."
+    fi
+fi
+
+if [[ "$needs_cursor" -eq 1 ]]; then
+    command -v agent >/dev/null 2>&1 || fail "Cursor agent not found."
+    command -v node >/dev/null 2>&1 || fail "Node.js not found."
+fi
+
+if [[ "$MODE" == "--run" ]]; then
+    command -v sync >/dev/null 2>&1 || fail "sync not found."
+    command -v checkpoint >/dev/null 2>&1 || fail "checkpoint not found."
+fi
+
+# ============================================================
+# State
+# ============================================================
+
+BRANCH=""
+SHA=""
+SHORT_SHA=""
+REMOTE_SHA=""
+
+refresh_state() {
+    BRANCH=$(git branch --show-current)
+
+    [[ -n "$BRANCH" ]] || fail "detached HEAD."
+
+    if [[ -n "$(git status --porcelain)" ]]; then
+        if [[ "$MODE" == "--implement-only" \
+           && "${AUTOCYCLE_ALLOW_DIRTY:-0}" == "1" ]]; then
+            :
+        else
+            echo "Working tree:"
+            git status --short
+            fail "working tree is not clean."
+        fi
+    fi
+
+    git fetch --prune origin >/dev/null 2>&1 \
+        || fail "could not fetch origin."
+
+    SHA=$(git rev-parse HEAD)
+    SHORT_SHA=$(git rev-parse --short HEAD)
+
+    if ! git show-ref --verify --quiet "refs/remotes/origin/$BRANCH"; then
+        fail "origin/$BRANCH does not exist."
+    fi
+
+    REMOTE_SHA=$(git rev-parse "origin/$BRANCH")
+
+    if [[ "$REMOTE_SHA" != "$SHA" ]]; then
+        echo "Local:  $SHA"
+        echo "Remote: $REMOTE_SHA"
+        fail "local branch and GitHub are not synchronized."
+    fi
+}
+
+refresh_state
+
+# ============================================================
+# Storage
+# ============================================================
+
+LOG_DIR=$(git rev-parse --git-path autocycle)
+if [[ "$LOG_DIR" != /* ]]; then LOG_DIR="$ROOT/$LOG_DIR"; fi
+mkdir -p "$LOG_DIR"
+
+CACHE_FILE="$LOG_DIR/current-review"
+QUEUE_HELPER="$HOME/.autocycle/instructions.py"
+HUMAN_INPUT_PROMPT=""
+if [[ -n "${AUTOCYCLE_INPUT_KEY:-}" ]]; then
+    [[ "$AUTOCYCLE_INPUT_KEY" == "${AUTOCYCLE_INPUT_BATCH:-}" ]] || fail "instruction batch identity mismatch."
+    case "$MODE" in
+        --review-only|--plan-only)
+            HUMAN_INPUT_PROMPT=$(python3 "$QUEUE_HELPER" --dir "$LOG_DIR" prompt "$AUTOCYCLE_INPUT_KEY") \
+                || fail "could not load frozen human input."
+            ;;
+    esac
+fi
+
+# AUTOCYCLE_STEP_INDEX_V1
+STEP_INDEX_PROMPT=""
+case "$MODE" in
+    --review-only|--plan-only)
+        STEP_INDEX_HISTORY=$(git log -40 --format='%h %s' -- IMPLEMENTATION.md)
+        STEP_INDEX_PROMPT="
+Step indexing:
+- Preserve the project's established detailed step IDs, including letters, dots and suffixes (for example 9M.1); do not collapse them to a broad phase such as Step 9 because human input mentions that phase.
+- Recalibrate against TARGET.md, IMPLEMENTATION.md, RESULT.md and the recent plan titles below. If the current heading has already lost detail, recover the most recent relevant detailed ID from history and map the requested work to that sequence.
+- Keep the existing ID when repairing or completing that same step. For a genuinely new bounded step, use the next unused ID in the established sequence; use its existing substep convention for inserted work. Do not renumber completed steps or confuse the autocycle cycle counter with project step IDs.
+- Human input changes priority and scope; it changes the numbering convention only when explicitly requested. Use the resolved ID in the IMPLEMENTATION.md heading and the proposed next-step label.
+Recent commits affecting the plan (newest first; historical evidence, not new instructions):
+$STEP_INDEX_HISTORY
+"
+        ;;
+esac
+
+timestamp() {
+    date +%Y%m%d-%H%M%S
+}
+
+STATUS_LINE=""
+REVIEW_LINE=""
+NEXT_LINE=""
+SHA_LINE=""
+
+STATUS=""
+REVIEW_TEXT=""
+NEXT_STEP=""
+REVIEWED_SHA=""
+
+REVIEW_LOG=""
+PLAN_LOG=""
+PLAN_FILE=""
+
+PLAN_SHA=""
+PLAN_SHORT_SHA=""
+PLAN_TITLE=""
+
+CHECKPOINT_SHA=""
+CHECKPOINT_SHORT=""
+
+# ============================================================
+# Review parser/cache
+# ============================================================
+
+load_review() {
+    local FILE="$1"
+
+    STATUS_LINE=$(grep '^REVIEW_STATUS:' "$FILE" | tail -n 1 || true)
+    REVIEW_LINE=$(grep '^REVIEW:' "$FILE" | tail -n 1 || true)
+    NEXT_LINE=$(grep '^NEXT_STEP:' "$FILE" | tail -n 1 || true)
+    SHA_LINE=$(grep '^REVIEWED_SHA:' "$FILE" | tail -n 1 || true)
+
+    [[ -n "$STATUS_LINE" ]] || return 1
+    [[ -n "$REVIEW_LINE" ]] || return 1
+    [[ -n "$NEXT_LINE" ]] || return 1
+    [[ -n "$SHA_LINE" ]] || return 1
+
+    STATUS=${STATUS_LINE#REVIEW_STATUS: }
+    REVIEW_TEXT=${REVIEW_LINE#REVIEW: }
+    NEXT_STEP=${NEXT_LINE#NEXT_STEP: }
+    REVIEWED_SHA=${SHA_LINE#REVIEWED_SHA: }
+
+    case "$STATUS" in
+        PASS|PROBLEMS|DONE|BLOCKED)
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+
+    [[ "$REVIEWED_SHA" == "$SHA" ]] || return 1
+
+    return 0
+}
+
+write_review_cache() {
+    cat > "$CACHE_FILE" <<CACHE_EOF
+CACHE_BRANCH: $BRANCH
+INPUT_BATCH: ${AUTOCYCLE_INPUT_KEY:-}
+$STATUS_LINE
+$REVIEW_LINE
+$NEXT_LINE
+$SHA_LINE
+CACHE_EOF
+}
+
+cached_review_is_valid() {
+    [[ -f "$CACHE_FILE" ]] || return 1
+
+    local CACHE_BRANCH
+    CACHE_BRANCH=$(grep '^CACHE_BRANCH:' "$CACHE_FILE" | tail -n 1 || true)
+    CACHE_BRANCH=${CACHE_BRANCH#CACHE_BRANCH: }
+
+    [[ "$CACHE_BRANCH" == "$BRANCH" ]] || return 1
+    [[ "$(sed -n 's/^INPUT_BATCH: //p' "$CACHE_FILE" | tail -n 1)" == "${AUTOCYCLE_INPUT_KEY:-}" ]] || return 1
+    load_review "$CACHE_FILE" || return 1
+    [[ "$REVIEWED_SHA" == "$SHA" ]] || return 1
+    [[ "$(git rev-parse "origin/$BRANCH")" == "$SHA" ]] || return 1
+    [[ -z "$(git status --porcelain)" ]] || return 1
+
+    return 0
+}
+
+# ============================================================
+# Review
+# ============================================================
+
+run_review() {
+    live_start "Review"
+
+    local T
+    local PROMPT
+    local EXIT_CODE
+
+    T=$(timestamp)
+    REVIEW_LOG="$LOG_DIR/review-$T.log"
+
+    PROMPT=$(cat <<PROMPT_EOF
+Review HEAD $SHA on branch $BRANCH against the current IMPLEMENTATION.md and TARGET.md if present.
+
+$HUMAN_INPUT_PROMPT
+$STEP_INDEX_PROMPT
+
+Inspect only what is necessary:
+- latest implementation diff
+- changed files
+- directly relevant tests/evidence
+- $LOG_DIR/latest-implementation, if present: use its log only if HEAD and branch match; assess actual verification, not todo labels alone
+- An implementation may legitimately produce no diff; evaluate acceptance against the current files and evidence.
+
+Avoid broad repository scans unless needed.
+
+Do not modify files, implement, commit, push, or narrate your investigation.
+
+Return ONLY:
+
+REVIEW_STATUS: PASS | PROBLEMS | DONE | BLOCKED
+REVIEW: <maximum 25 words>
+NEXT_STEP: <one bounded next step, maximum 30 words, or NONE>
+REVIEWED_SHA: $SHA
+PROMPT_EOF
+)
+
+    set +e
+    codex exec --sandbox read-only "$PROMPT" \
+        >"$REVIEW_LOG" 2>&1
+    EXIT_CODE=$?
+    set -e
+
+    if [[ "$EXIT_CODE" -ne 0 ]]; then
+        tail -n 15 "$REVIEW_LOG"
+        fail "Codex review. Log: $REVIEW_LOG"
+    fi
+
+    load_review "$REVIEW_LOG" \
+        || fail "invalid Codex review. Log: $REVIEW_LOG"
+
+    [[ "$(git rev-parse HEAD)" == "$SHA" ]] \
+        || fail "HEAD changed during review."
+
+    [[ -z "$(git status --porcelain)" ]] \
+        || fail "repository changed during review."
+
+    printf '\nAUTOCYCLE_REVIEW_INPUT: %s\n' "${AUTOCYCLE_INPUT_KEY:-}" >> "$REVIEW_LOG"
+    write_review_cache
+
+    live_done "Found: $REVIEW_TEXT"
+}
+
+# ============================================================
+# Plan
+# ============================================================
+
+run_plan() {
+    live_start "Plan"
+
+    local T
+    local PROMPT
+    local EXIT_CODE
+    local BEGIN_LINE
+    local END_LINE
+    local FIRST_LINE
+
+    T=$(timestamp)
+    PLAN_LOG="$LOG_DIR/plan-$T.log"
+    PLAN_FILE="$LOG_DIR/IMPLEMENTATION-$T.md"
+
+    PROMPT=$(cat <<PROMPT_EOF
+Create the next IMPLEMENTATION.md from:
+
+SHA: $SHA
+STATUS: $STATUS
+REVIEW: $REVIEW_TEXT
+NEXT_STEP: $NEXT_STEP
+
+$HUMAN_INPUT_PROMPT
+$STEP_INDEX_PROMPT
+Read existing IMPLEMENTATION.md, TARGET.md, and directly relevant files only as needed.
+
+Rules:
+- One bounded implementation step.
+- Cursor must never modify TARGET.md or IMPLEMENTATION.md.
+- Direct completion records and measured verification to RESULT.md.
+- Read RESULT.md when assessing the previous step.
+- If STATUS is PROBLEMS, repair it before advancing.
+- Preserve useful project-specific naming/conventions.
+- Prefer 2-4 concrete tasks.
+- Include only necessary files, actions, tests, and acceptance criteria.
+- Omit rationale, history, repetition, and obvious instructions.
+- Aim for no more than about 60 lines.
+- Do not implement, modify files, commit, or push.
+- No Markdown fences.
+
+Output ONLY:
+
+BEGIN_IMPLEMENTATION_MD
+<complete IMPLEMENTATION.md>
+END_IMPLEMENTATION_MD
+PROMPT_EOF
+)
+
+    set +e
+    codex exec --sandbox read-only "$PROMPT" \
+        >"$PLAN_LOG" 2>&1
+    EXIT_CODE=$?
+    set -e
+
+    if [[ "$EXIT_CODE" -ne 0 ]]; then
+        tail -n 15 "$PLAN_LOG"
+        fail "Codex planning. Log: $PLAN_LOG"
+    fi
+
+    if grep -q '^PLAN_STATUS: BLOCKED$' "$PLAN_LOG"; then
+        live_fail
+        echo "BLOCKED: planner could not reconcile the active instructions. Log: $PLAN_LOG"
+        exit 2
+    fi
+
+    # The transcript contains our prompt too.
+    # Use the LAST marker pair, which belongs to Codex's answer.
+
+    BEGIN_LINE=$(
+        grep -n '^BEGIN_IMPLEMENTATION_MD$' "$PLAN_LOG" \
+            | tail -n 1 \
+            | cut -d: -f1 \
+            || true
+    )
+
+    END_LINE=$(
+        grep -n '^END_IMPLEMENTATION_MD$' "$PLAN_LOG" \
+            | tail -n 1 \
+            | cut -d: -f1 \
+            || true
+    )
+
+    [[ -n "$BEGIN_LINE" ]] \
+        || fail "planner returned no IMPLEMENTATION.md block."
+
+    [[ -n "$END_LINE" ]] \
+        || fail "planner returned no closing marker."
+
+    (( BEGIN_LINE < END_LINE )) \
+        || fail "planner returned malformed markers."
+
+    sed -n "$((BEGIN_LINE + 1)),$((END_LINE - 1))p" \
+        "$PLAN_LOG" > "$PLAN_FILE"
+
+    [[ -s "$PLAN_FILE" ]] \
+        || fail "planner returned an empty IMPLEMENTATION.md."
+
+    FIRST_LINE=$(head -n 1 "$PLAN_FILE")
+
+    [[ "$FIRST_LINE" == \#* ]] \
+        || fail "generated IMPLEMENTATION.md has no heading."
+}
+
+# ============================================================
+# Push plan via isolated worktree
+# ============================================================
+
+push_plan() {
+    local REMOTE_NOW
+    local WORKTREE
+    local CHANGES
+    local CHANGED_PATHS
+
+    if [[ "$BRANCH" == "main" || "$BRANCH" == "master" ]]; then
+        fail "refusing to push an automated plan directly to $BRANCH."
+    fi
+
+    git fetch --prune origin >/dev/null 2>&1 \
+        || fail "could not refresh origin."
+
+    REMOTE_NOW=$(git rev-parse "origin/$BRANCH")
+
+    [[ "$REMOTE_NOW" == "$SHA" ]] \
+        || fail "GitHub changed during review/planning."
+
+    WORKTREE=$(mktemp -d "${TMPDIR:-/tmp}/autocycle-plan.XXXXXX")
+
+    cleanup_worktree() {
+        git -C "$ROOT" worktree remove --force "$WORKTREE" \
+            >/dev/null 2>&1 || true
+        rm -rf "$WORKTREE" >/dev/null 2>&1 || true
+    }
+
+    trap 'live_stop_timer; cleanup_worktree' EXIT
+
+    git worktree add --detach "$WORKTREE" "$SHA" \
+        >/dev/null 2>&1 \
+        || fail "could not create planning worktree."
+
+    cp "$PLAN_FILE" "$WORKTREE/IMPLEMENTATION.md"
+
+    CHANGES=$(git -C "$WORKTREE" status --porcelain)
+
+    [[ -n "$CHANGES" ]] \
+        || fail "new IMPLEMENTATION.md is identical to the old one."
+
+    CHANGED_PATHS=$(
+        git -C "$WORKTREE" status --porcelain \
+            | sed 's/^...//' \
+            | sort -u
+    )
+
+    if [[ "$CHANGED_PATHS" != "IMPLEMENTATION.md" ]]; then
+        echo "$CHANGES"
+        fail "planning changed files other than IMPLEMENTATION.md."
+    fi
+
+    git -C "$WORKTREE" add IMPLEMENTATION.md
+
+    PLAN_TITLE=$(
+        head -n 1 "$PLAN_FILE" \
+            | sed -E 's/^#+[[:space:]]*//'
+    )
+
+    [[ -n "$PLAN_TITLE" ]] || PLAN_TITLE="next implementation"
+
+    local INPUT_COMMIT_NOTE=""
+    if [[ -n "${AUTOCYCLE_INPUT_KEY:-}" ]]; then
+        INPUT_COMMIT_NOTE=$(printf '\n\nAutocycle-Input-Batch: %s' "$AUTOCYCLE_INPUT_KEY")
+    fi
+    git -C "$WORKTREE" commit \
+        -m "Plan: $PLAN_TITLE$INPUT_COMMIT_NOTE" \
+        >/dev/null 2>&1 \
+        || fail "could not commit planning change."
+
+    PLAN_SHA=$(git -C "$WORKTREE" rev-parse HEAD)
+    PLAN_SHORT_SHA=$(git -C "$WORKTREE" rev-parse --short HEAD)
+
+    git fetch --prune origin >/dev/null 2>&1 \
+        || fail "could not perform final remote check."
+
+    REMOTE_NOW=$(git rev-parse "origin/$BRANCH")
+
+    [[ "$REMOTE_NOW" == "$SHA" ]] \
+        || fail "GitHub changed before planning push."
+
+    git -C "$WORKTREE" push origin \
+        "HEAD:refs/heads/$BRANCH" \
+        >/dev/null 2>&1 \
+        || fail "could not push planning commit."
+
+    git fetch origin "$BRANCH" >/dev/null 2>&1
+
+    [[ "$(git rev-parse "origin/$BRANCH")" == "$PLAN_SHA" ]] \
+        || fail "planning push could not be verified."
+
+    if [[ -n "${AUTOCYCLE_INPUT_KEY:-}" ]]; then
+        python3 "$QUEUE_HELPER" --dir "$LOG_DIR" published "$AUTOCYCLE_INPUT_KEY" "$PLAN_SHA" \
+            || fail "published plan could not be bound to human input."
+    fi
+
+    rm -f "$CACHE_FILE"
+
+    cleanup_worktree
+    trap live_stop_timer EXIT
+
+    live_done "Planned: $PLAN_TITLE"
+}
+
+# ============================================================
+# Sync
+# ============================================================
+
+run_sync() {
+    local OUTPUT
+    local EXPECTED_BRANCH
+
+    EXPECTED_BRANCH="$BRANCH"
+
+    if ! OUTPUT=$(sync 2>&1); then
+        echo "$OUTPUT"
+        fail "sync"
+    fi
+
+    BRANCH=$(git branch --show-current)
+    SHA=$(git rev-parse HEAD)
+    SHORT_SHA=$(git rev-parse --short HEAD)
+
+    [[ "$BRANCH" == "$EXPECTED_BRANCH" ]] \
+        || fail "sync unexpectedly switched branches."
+
+    [[ "$SHA" == "$PLAN_SHA" ]] \
+        || fail "sync did not reach planning commit $PLAN_SHORT_SHA."
+
+    [[ -z "$(git status --porcelain)" ]] \
+        || fail "working tree is not clean after sync."
+}
+
+# ============================================================
+# Cursor implementation using ACP
+# ============================================================
+
+# ownership guard v1
+assert_owned_docs() {
+    local OWNERSHIP_BASE="${1:-HEAD}"
+    if ! python3 - "$OWNERSHIP_BASE" <<'OWNERSHIP_PY'
+import os, stat, subprocess, sys
+from pathlib import Path
+
+def git(*args):
+    return subprocess.check_output(['git', *args])
+try:
+    baseline = git('rev-parse', '--verify', sys.argv[1] + '^{commit}').strip().decode()
+    root = Path(os.fsdecode(git('rev-parse', '--show-toplevel').rstrip(b'\n')))
+    for name in ('TARGET.md', 'IMPLEMENTATION.md'):
+        tree = git('ls-tree', '-z', baseline, '--', name)
+        index = git('ls-files', '--stage', '-z', '--', name)
+        path = root / name
+        if not tree:
+            if index or os.path.lexists(path):
+                raise RuntimeError(name + ' was added outside Plan')
+            continue
+        mode, kind, oid = tree.split(b'\t', 1)[0].split()
+        if kind != b'blob' or mode not in (b'100644', b'100755'):
+            raise RuntimeError(name + ' must be a regular tracked file')
+        expected_index = mode + b' ' + oid + b' 0\t' + name.encode() + b'\0'
+        if index != expected_index:
+            raise RuntimeError(name + ' differs in the Git index')
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode):
+            raise RuntimeError(name + ' is no longer a regular file')
+        executable = bool(info.st_mode & stat.S_IXUSR)
+        if executable != (mode == b'100755') or path.read_bytes() != git('cat-file', 'blob', oid.decode()):
+            raise RuntimeError(name + ' differs from the synced plan')
+except Exception as error:
+    print('Ownership check: ' + str(error), file=sys.stderr)
+    sys.exit(1)
+OWNERSHIP_PY
+    then
+        fail "protected plan/target changed or could not be verified; work preserved."
+    fi
+}
+# end ownership guard
+
+run_cursor() {
+    local ATTEMPT="${1:-1}"
+    local T
+    local CURSOR_LOG
+    local BEFORE_SHA
+    local EXIT_CODE
+
+    T=$(timestamp)
+    CURSOR_LOG="$LOG_DIR/cursor-$T.log"
+    BEFORE_SHA=$(git rev-parse HEAD)
+    assert_owned_docs "$BEFORE_SHA"
+
+    if [[ -n "$(git status --porcelain)" \
+       && "${AUTOCYCLE_ALLOW_DIRTY:-0}" != "1" ]]; then
+        fail "working tree must be clean before implementation."
+    fi
+
+    set +e
+
+    node - "$ROOT" "$CURSOR_LOG" <<'NODE'
+const { spawn, execFileSync } = require("node:child_process");
+const readline = require("node:readline");
+const fs = require("node:fs");
+
+const root = process.argv[2];
+const logFile = process.argv[3];
+
+process.chdir(root);
+
+function git(...args) {
+  return execFileSync("git", args, {
+    cwd: root,
+    encoding: "utf8"
+  }).trim();
+}
+
+const beforeSha = git("rev-parse", "HEAD");
+const beforeBranch = git("branch", "--show-current");
+
+if (
+  git("status", "--porcelain") &&
+  process.env.AUTOCYCLE_ALLOW_DIRTY !== "1"
+) {
+  console.error("Implementation failed: working tree is not clean.");
+  process.exit(1);
+}
+
+const log = fs.createWriteStream(logFile, { flags: "a" });
+const started = Date.now();
+
+let nextId = 1;
+const pending = new Map();
+
+const todos = new Map();
+let todoOrder = [];
+
+let renderedLines = 0;
+let finished = false;
+let shuttingDown = false;
+let retryableStall = false;
+
+function elapsed() {
+  const seconds = Math.floor((Date.now() - started) / 1000);
+  const minutes = Math.floor(seconds / 60);
+  const secs = seconds % 60;
+
+  return (
+    String(minutes).padStart(2, "0") +
+    ":" +
+    String(secs).padStart(2, "0")
+  );
+}
+
+function shorten(text) {
+  let value = String(text || "")
+    .replace(/\s+/g, " ")
+    .replace(/[.:;]+$/, "")
+    .trim();
+
+  if (value.length > 42) {
+    value = value.slice(0, 39).trimEnd() + "...";
+  }
+
+  return value;
+}
+
+function icon(status) {
+  switch (status) {
+    case "completed":
+      return "✓";
+    case "in_progress":
+      return "▶";
+    case "cancelled":
+      return "–";
+    default:
+      return "○";
+  }
+}
+
+function displayItems() {
+  const real = todoOrder
+    .map(id => todos.get(id))
+    .filter(Boolean);
+
+  if (real.length > 0) {
+    return real;
+  }
+
+  return [{
+    id: "fallback",
+    content: finished ? "Implementation" : "Working",
+    status: finished ? "completed" : "in_progress"
+  }];
+}
+
+function linesForDisplay() {
+  return [
+    finished ? `Implement   ✓ ${elapsed()}` : `Implement   ${elapsed()}`,
+    ...displayItems().map(item =>
+      `    ${icon(item.status)} ${shorten(item.content)}`)
+  ];
+}
+
+function redraw(forceFinal = false) {
+  const lines = linesForDisplay();
+
+  if (!process.stdout.isTTY) {
+    if (forceFinal) {
+      process.stdout.write(lines.join("\n") + "\n");
+    }
+    return;
+  }
+
+  if (renderedLines > 0) {
+    process.stdout.write(`\x1b[${renderedLines}A`);
+  }
+
+  const height = Math.max(renderedLines, lines.length);
+
+  for (let i = 0; i < height; i++) {
+    const line = lines[i] || "";
+    process.stdout.write(`\x1b[2K\r${line}\n`);
+  }
+
+  if (height > lines.length) {
+    process.stdout.write(
+      `\x1b[${height - lines.length}A`
+    );
+  }
+
+  renderedLines = lines.length;
+}
+
+function mergeTodos(incoming, merge) {
+  if (!merge) {
+    todos.clear();
+    todoOrder = [];
+  }
+
+  for (const todo of incoming || []) {
+    if (!todos.has(todo.id)) {
+      todoOrder.push(todo.id);
+    }
+
+    const previous = todos.get(todo.id) || {};
+    todos.set(todo.id, { ...previous, ...todo });
+  }
+
+  redraw();
+}
+
+const agent = spawn("agent", ["acp"], {
+  cwd: root,
+  stdio: ["pipe", "pipe", "pipe"]
+});
+
+agent.stderr.on("data", chunk => {
+  log.write(`[stderr] ${chunk}`);
+});
+
+function send(method, params) {
+  const id = nextId++;
+
+  agent.stdin.write(
+    JSON.stringify({
+      jsonrpc: "2.0",
+      id,
+      method,
+      params
+    }) + "\n"
+  );
+
+  return new Promise((resolve, reject) => {
+    pending.set(id, { resolve, reject });
+  });
+}
+
+function respond(id, result) {
+  agent.stdin.write(
+    JSON.stringify({
+      jsonrpc: "2.0",
+      id,
+      result
+    }) + "\n"
+  );
+}
+
+const rl = readline.createInterface({
+  input: agent.stdout
+});
+
+rl.on("line", line => {
+  log.write(line + "\n");
+
+  let msg;
+
+  try {
+    msg = JSON.parse(line);
+  } catch {
+    return;
+  }
+
+  const updateText =
+    msg?.params?.update?.content?.text;
+
+  if (
+    msg.method === "session/update" &&
+    typeof updateText === "string" &&
+    updateText.includes("Connection stalled")
+  ) {
+    retryableStall = true;
+  }
+
+  if (
+    msg.id !== undefined &&
+    (msg.result !== undefined || msg.error !== undefined)
+  ) {
+    const waiter = pending.get(msg.id);
+
+    if (!waiter) {
+      return;
+    }
+
+    pending.delete(msg.id);
+
+    if (msg.error !== undefined) {
+      waiter.reject(msg.error);
+    } else {
+      waiter.resolve(msg.result);
+    }
+
+    return;
+  }
+
+  if (msg.method === "session/request_permission") {
+    const options = msg.params?.options || [];
+
+    const allow =
+      options.find(option => option.kind === "allow_always") ||
+      options.find(option => option.kind === "allow_once") ||
+      options.find(option =>
+        /allow|approve/i.test(
+          `${option.name || ""} ${option.label || ""} ${option.optionId || ""}`
+        )
+      ) ||
+      options[0];
+
+    if (!allow) {
+      respond(msg.id, {
+        outcome: {
+          outcome: "cancelled"
+        }
+      });
+      return;
+    }
+
+    respond(msg.id, {
+      outcome: {
+        outcome: "selected",
+        optionId: allow.optionId
+      }
+    });
+    return;
+  }
+
+  if (msg.method === "cursor/create_plan") {
+    mergeTodos(msg.params?.todos || [], false);
+
+    respond(msg.id, {
+      outcome: {
+        outcome: "accepted"
+      }
+    });
+    return;
+  }
+
+  if (msg.method === "cursor/ask_question") {
+    respond(msg.id, {
+      outcome: {
+        outcome: "skipped",
+        reason:
+          "Autonomous implementation. Follow IMPLEMENTATION.md; stop if external input is required."
+      }
+    });
+    return;
+  }
+
+  if (msg.method === "cursor/update_todos") {
+    mergeTodos(
+      msg.params?.todos || [],
+      Boolean(msg.params?.merge)
+    );
+  }
+});
+
+agent.on("exit", code => {
+  if (shuttingDown) {
+    return;
+  }
+
+  for (const { reject } of pending.values()) {
+    reject(
+      new Error(`Cursor ACP exited unexpectedly (${code}).`)
+    );
+  }
+
+  pending.clear();
+});
+
+const timer = setInterval(() => {
+  redraw();
+}, 1000);
+
+const prompt = `
+Read TARGET.md if present and the current IMPLEMENTATION.md.
+
+Implement exactly the current implementation step.
+
+Before editing, create a concise todo list of 2-5 subtasks.
+Each todo label must be only 2-5 words.
+Keep todo statuses updated while working.
+
+Requirements:
+- Work only in this repository.
+- Run tests and verification required by IMPLEMENTATION.md.
+- A completed step may require no edits. Reverify acceptance, report measured results, and finish normally.
+- Do not make cosmetic edits solely to create a diff.
+- TARGET.md and IMPLEMENTATION.md are strictly read-only, even if the plan requests edits.
+- Record measured verification and completion in RESULT.md when needed.
+- Report required plan changes in RESULT.md; never rewrite the plan.
+- Do not create or switch branches.
+- Do not commit.
+- Do not push.
+- Do not run sync or checkpoint.
+- Do not begin the next implementation step.
+- Do not ask the user questions.
+- If external input is genuinely required, stop instead of guessing.
+- Keep the final prose response extremely short; the todo display is the primary result.
+`;
+
+// autocycle completion guard v2
+function validateCompletion(result, items) {
+  if (result?.stopReason !== "end_turn") {
+    throw new Error("Cursor did not finish normally: " +
+      (result?.stopReason || "missing stopReason"));
+  }
+  if (!items.length) {
+    throw new Error("Cursor supplied no task completion evidence.");
+  }
+  const unfinished = items.find(item =>
+    !["completed", "cancelled"].includes(item.status));
+  if (unfinished) {
+    throw new Error("Cursor stopped with unfinished or unknown task: " +
+      unfinished.content + " [" + String(unfinished.status) + "]");
+  }
+  if (!items.some(item => item.status === "completed")) {
+    throw new Error("Cursor cancelled every task; implementation unverified.");
+  }
+}
+
+async function main() {
+  try {
+    await send("initialize", {
+      protocolVersion: 1,
+      clientCapabilities: {
+        fs: {
+          readTextFile: false,
+          writeTextFile: false
+        },
+        terminal: false
+      },
+      clientInfo: {
+        name: "autocycle",
+        version: "1.0.0"
+      }
+    });
+
+    await send("authenticate", {
+      methodId: "cursor_login"
+    });
+
+    const session = await send("session/new", {
+      cwd: root,
+      mcpServers: []
+    });
+
+    const result = await send("session/prompt", {
+      sessionId: session.sessionId,
+      prompt: [{
+        type: "text",
+        text: prompt
+      }]
+    });
+
+    log.write(`\n[result] stopReason=${result?.stopReason || "unknown"}\n`);
+    validateCompletion(result, todoOrder.map(id => todos.get(id)).filter(Boolean));
+    if (git("branch", "--show-current") !== beforeBranch) {
+      throw new Error("Cursor switched Git branches.");
+    }
+    const afterSha = git("rev-parse", "HEAD");
+
+    if (afterSha !== beforeSha) {
+      throw new Error(
+        "Cursor changed Git HEAD."
+      );
+    }
+
+    const changes = git("status", "--porcelain");
+
+    if (!changes) {
+      log.write("\n[result] no_changes=true; normal completion accepted\n");
+    }
+
+    finished = true;
+
+    clearInterval(timer);
+    redraw(true);
+
+    log.write(
+      `\n[result] stopReason=${result?.stopReason || "unknown"}\n`
+    );
+
+    shuttingDown = true;
+    agent.stdin.end();
+    agent.kill();
+    log.end();
+
+  } catch (err) {
+    clearInterval(timer);
+
+    log.write(
+      `\n[error] ${err?.stack || String(err)}\n`
+    );
+
+    shuttingDown = true;
+
+    try {
+      agent.stdin.end();
+      agent.kill();
+    } catch {}
+
+    const sameHead =
+      git("rev-parse", "HEAD") === beforeSha;
+
+    const clean =
+      git("status", "--porcelain") === "";
+
+    const safeToRetry =
+      retryableStall && sameHead && clean &&
+      git("branch", "--show-current") === beforeBranch;
+
+    log.end();
+
+    if (safeToRetry) {
+      process.stdout.write("\n");
+    } else {
+      process.stderr.write("\n");
+      process.stderr.write(
+        `✗ ${err?.message || String(err)}\n`
+      );
+      process.stderr.write(`Log: ${logFile}\n`);
+    }
+
+    process.exit(safeToRetry ? 75 : 1);
+  }
+}
+
+main();
+NODE
+
+    EXIT_CODE=$?
+    set -e
+
+    if [[ "$EXIT_CODE" -eq 75 ]]; then
+        if [[ "$ATTEMPT" -lt 3 ]]; then
+            echo "Implement connection stalled — retry $ATTEMPT/2"
+            sleep 2
+            run_cursor "$((ATTEMPT + 1))"
+            return
+        fi
+
+        fail "implementation connection stalled after 3 attempts. Log: $CURSOR_LOG"
+    fi
+
+    if [[ "$EXIT_CODE" -ne 0 ]]; then
+        fail "implementation. Log: $CURSOR_LOG"
+    fi
+
+    [[ "$(git rev-parse HEAD)" == "$BEFORE_SHA" ]] \
+        || fail "implementation changed Git HEAD."
+
+    assert_owned_docs "$BEFORE_SHA"
+
+    # Save a pointer to this successful run's evidence, including no-change runs.
+    local EVIDENCE_TMP="$LOG_DIR/latest-implementation.tmp.$$"
+    printf 'HEAD: %s\nBRANCH: %s\nLOG: %s\n' \
+        "$BEFORE_SHA" "$(git branch --show-current)" "$CURSOR_LOG" > "$EVIDENCE_TMP"
+    mv "$EVIDENCE_TMP" "$LOG_DIR/latest-implementation"
+}
+
+# ============================================================
+# Checkpoint
+# ============================================================
+
+run_checkpoint() {
+    local OUTPUT
+    local BEFORE
+
+    BEFORE=$(git rev-parse HEAD)
+
+    assert_owned_docs "$BEFORE"
+    if [[ -z "$(git status --porcelain)" ]]; then
+        BRANCH=$(git branch --show-current)
+        git fetch origin "$BRANCH" >/dev/null 2>&1 || fail "could not verify no-change checkpoint."
+        [[ "$(git rev-parse "origin/$BRANCH")" == "$BEFORE" ]] || fail "no-change HEAD is not on GitHub."
+        CHECKPOINT_SHA="$BEFORE"
+        CHECKPOINT_SHORT="skipped (no changes)"
+        rm -f "$CACHE_FILE"
+        return 0
+    fi
+    if ! OUTPUT=$(checkpoint 2>&1); then
+        echo "$OUTPUT"
+        fail "checkpoint"
+    fi
+
+    CHECKPOINT_SHA=$(git rev-parse HEAD)
+    CHECKPOINT_SHORT=$(git rev-parse --short HEAD)
+
+    [[ "$CHECKPOINT_SHA" != "$BEFORE" ]] \
+        || fail "checkpoint created no commit."
+
+    BRANCH=$(git branch --show-current)
+
+    git fetch origin "$BRANCH" >/dev/null 2>&1 \
+        || fail "could not verify checkpoint."
+
+    [[ "$(git rev-parse "origin/$BRANCH")" == "$CHECKPOINT_SHA" ]] \
+        || fail "checkpoint is not on GitHub."
+}
+
+# ============================================================
+# Dry run
+# ============================================================
+
+if [[ "$MODE" == "--dry-run" ]]; then
+    for ((CYCLE=1; CYCLE<=MAX_CYCLES; CYCLE++)); do
+        echo
+        echo "Cycle       $CYCLE/$MAX_CYCLES"
+        echo
+        echo "Review      ✓ 00:41"
+        echo "    Found: Latest implementation is correct and the next bounded step is clear."
+        echo "Plan        ✓ 00:27"
+        echo "    Planned: Step 9M.3E — Next bounded implementation"
+        echo "Sync        ✓ abc1234"
+        echo "Implement   ✓ 04:37"
+        echo "    ✓ Regressions"
+        echo "    ✓ Validation"
+        echo "    ✓ Integration"
+        echo "    ✓ Benchmark"
+        echo "Checkpoint  ✓ e8a912f"
+    done
+
+    exit 0
+fi
+
+# ============================================================
+# Review only
+# ============================================================
+
+if [[ "$MODE" == "--review-only" ]]; then
+    run_review
+
+    exit 0
+fi
+
+# ============================================================
+# Plan only
+# ============================================================
+
+if [[ "$MODE" == "--plan-only" ]]; then
+    if ! cached_review_is_valid; then
+        echo
+        echo "No valid review exists for $SHORT_SHA."
+        echo
+        echo "Run:"
+        echo "  autocycle --review-only"
+        exit 1
+    fi
+
+    if [[ "$STATUS" == "DONE" ]]; then
+        echo "Review says DONE."
+        exit 0
+    fi
+
+    if [[ "$STATUS" == "BLOCKED" ]]; then
+        echo "Review says BLOCKED: $REVIEW_TEXT"
+        exit 2
+    fi
+
+    run_plan
+    push_plan
+
+    exit 0
+fi
+
+# ============================================================
+# Implement only
+# ============================================================
+
+if [[ "$MODE" == "--implement-only" ]]; then
+    run_cursor
+    exit 0
+fi
+
+# ============================================================
+# Full autocycle
+# ============================================================
+
+for ((CYCLE=1; CYCLE<=MAX_CYCLES; CYCLE++)); do
+
+    refresh_state
+
+    echo
+    echo "Cycle       $CYCLE/$MAX_CYCLES"
+    echo
+
+    # Review
+    run_review
+
+    if [[ "$STATUS" == "DONE" ]]; then
+        echo "Review      ✓ DONE"
+        break
+    fi
+
+    if [[ "$STATUS" == "BLOCKED" ]]; then
+        echo "Review      ✗ BLOCKED"
+        echo
+        echo "$REVIEW_TEXT"
+        exit 2
+    fi
+
+    # Plan
+    run_plan
+    push_plan
+
+    # Sync
+    run_sync
+    echo "Sync        ✓"
+    echo
+
+    # Cursor
+    run_cursor
+    echo
+
+    # Checkpoint
+    run_checkpoint
+    echo "Checkpoint  ✓ $CHECKPOINT_SHORT"
+done
