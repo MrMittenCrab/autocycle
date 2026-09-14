@@ -17,22 +17,80 @@ def event(kind,prompt=''):
  if os.environ.get('FAIL_STAGE')==kind:sys.exit(1)
 '''
 CODEX='#!/usr/bin/env python3\n'+COMMON+r'''
-if sys.argv[1:]==['login','status']:
+args=sys.argv[1:]
+
+if args==['login','status']:
  print('Logged in using ChatGPT');sys.exit(0)
-prompt=sys.argv[-1];kind='review' if prompt.startswith('Review HEAD') else 'plan'
+
+answer=None
+if '--output-last-message' in args:
+ i=args.index('--output-last-message')
+ if i+1>=len(args):sys.exit(2)
+ answer=Path(args[i+1])
+
+prompt=args[-1]
+kind='review' if prompt.startswith('Review HEAD') else 'plan'
 event(kind,prompt)
+
+def emit(lines):
+ text='\n'.join(lines)+'\n'
+ if answer is not None:
+  answer.write_text(text)
+ print(text,end='')
+
 if kind=='review':
- print('REVIEW_STATUS: '+os.environ.get('REVIEW_STATUS','PASS'))
- print('REVIEW: verified')
- print('NEXT_STEP: next bounded task')
- print('REVIEWED_SHA: '+git('rev-parse','HEAD'))
+ status=os.environ.get('REVIEW_STATUS','PASS')
+ active='Allowed INPUT_STATUS: COMPLETE | PENDING' in prompt
+
+ input_status=os.environ.get('INPUT_STATUS_OVERRIDE')
+ if not input_status:
+  input_status='PENDING' if active else 'NONE'
+
+ if status=='BLOCKED':
+  next_step='provide required human decision'
+  human_action='provide required human decision'
+  blocker_key='test-human-blocker'
+ elif status=='DONE':
+  next_step='NONE'
+  human_action='NONE'
+  blocker_key='NONE'
+ else:
+  next_step='next bounded task'
+  human_action='NONE'
+  blocker_key='NONE'
+
+ emit([
+  'REVIEW_STATUS: '+status,
+  'REVIEW: verified',
+  'NEXT_STEP: '+next_step,
+  'REVIEWED_SHA: '+git('rev-parse','HEAD'),
+  'HUMAN_ACTION: '+human_action,
+  'BLOCKER_KEY: '+blocker_key,
+  'INPUT_STATUS: '+input_status,
+ ])
 else:
- if os.environ.get('PLAN_BLOCKED')=='1':print('PLAN_STATUS: BLOCKED');sys.exit(0)
- count=sum(json.loads(x)['kind']=='plan' for x in (a/'events.jsonl').read_text().splitlines())
- print('BEGIN_IMPLEMENTATION_MD')
- print('# Step Q'+str(count)+' — deterministic test plan\n\n### Task 1: Verify work\nRecord measured results in RESULT.md.')
- print('END_IMPLEMENTATION_MD')
+ if os.environ.get('PLAN_BLOCKED')=='1':
+  emit([
+   'PLAN_STATUS: BLOCKED',
+   'BLOCKER: deterministic test blocker',
+  ])
+  sys.exit(0)
+
+ count=sum(
+  json.loads(x)['kind']=='plan'
+  for x in (a/'events.jsonl').read_text().splitlines()
+ )
+
+ emit([
+  'BEGIN_IMPLEMENTATION_MD',
+  '# Step Q'+str(count)+' — deterministic test plan',
+  '',
+  '### Task 1: Verify work',
+  'Record measured results in RESULT.md.',
+  'END_IMPLEMENTATION_MD',
+ ])
 '''
+
 AGENT='#!/usr/bin/env python3\n'+COMMON+r'''
 for line in sys.stdin:
  msg=json.loads(line)
@@ -47,6 +105,11 @@ for line in sys.stdin:
   statuses=['completed','cancelled']
   if os.environ.get('TODO_PENDING')=='1':statuses=['completed','pending']
   print(json.dumps({'jsonrpc':'2.0','method':'cursor/update_todos','params':{'todos':[{'id':str(i),'content':'Task '+str(i),'status':s} for i,s in enumerate(statuses)],'merge':False}}),flush=True)
+  impl_status='BLOCKED' if os.environ.get('IMPLEMENT_BLOCKED')=='1' else 'COMPLETE'
+  message='IMPLEMENT_STATUS: '+impl_status+'\n'
+  if impl_status=='BLOCKED':
+   message+='BLOCKER: deterministic implementation blocker\n'
+  print(json.dumps({'jsonrpc':'2.0','method':'session/update','params':{'update':{'sessionUpdate':'agent_message_chunk','content':{'text':message}}}}),flush=True)
   result={'stopReason':'end_turn'}
  print(json.dumps({'jsonrpc':'2.0','id':msg['id'],'result':result}),flush=True)
 '''
@@ -72,11 +135,17 @@ class Case:
   self.git('remote','add','origin',str(self.p/'origin'));self.git('push','-qu','origin',initial)
   self.a=self.repo/'.git/autocycle';self.a.mkdir()
   helper=self.p/'instructions.py';helper.write_bytes((BASE/'instructions.py').read_bytes())
+  adjudicator=self.p/'adjudication.py';adjudicator.write_bytes((BASE/'adjudication.py').read_bytes())
+  migration=self.p/'migration.py';migration.write_bytes((BASE/'migration.py').read_bytes())
   for name in ('autocycle','stage'):
-   text=(BASE/name).read_text().replace('QUEUE_HELPER="$HOME/.autocycle/instructions.py"','QUEUE_HELPER='+str(helper)).replace('ENGINE="$HOME/.autocycle/stage"','ENGINE='+str(self.bin/'stage'))
+   text=(BASE/name).read_text().replace('QUEUE_HELPER="$HOME/.autocycle/instructions.py"','QUEUE_HELPER='+str(helper)).replace('ENGINE="$HOME/.autocycle/stage"','ENGINE='+str(self.bin/'stage')).replace('ADJUDICATOR="$HOME/.autocycle/adjudication.py"','ADJUDICATOR='+str(adjudicator))
    if name=='autocycle':
-    # Provider network is isolated; all actual Git commands still use local origin.
-    text=text.replace('if [[ "$MODE" != "--dry-run" ]]; then\n    pause_if_requested','network_ready() { return 0; }\nensure_network() { return 0; }\nif [[ "$MODE" != "--dry-run" ]]; then\n    pause_if_requested')
+    text=text.replace('python3 "$HOME/.autocycle/migration.py" "$STATE"','python3 "'+str(migration)+'" "$STATE"')
+    marker='[[ -x "$ENGINE" ]] || fail "internal autocycle engine missing: $ENGINE"'
+    override='network_ready() { return 0; }\nnetwork_recover() { return 0; }\nensure_network() { return 0; }\n\n'+marker
+    if marker not in text:
+     raise AssertionError('network override marker missing')
+    text=text.replace(marker,override,1)
    (self.bin/name).write_text(text);(self.bin/name).chmod(0o755)
   for name in ('sync','checkpoint'):(self.bin/name).write_bytes((BASE/name).read_bytes());(self.bin/name).chmod(0o755)
   for name,text in [('codex',CODEX),('agent',AGENT),('git',GIT)]:
@@ -86,7 +155,7 @@ class Case:
  def run(self,*args,**env):return subprocess.run([str(self.bin/'autocycle'),*args],cwd=self.repo,env=dict(self.env,**env),capture_output=True,text=True,timeout=25)
  def start(self,*args,**env):return subprocess.Popen([str(self.bin/'autocycle'),*args],cwd=self.repo,env=dict(self.env,**env),stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,start_new_session=True)
  def ready(self,p):
-  deadline=time.monotonic()+12
+  deadline=time.monotonic()+30
   while not (self.a/'ready').exists() and p.poll() is None and time.monotonic()<deadline:time.sleep(.02)
   if not (self.a/'ready').exists():raise AssertionError(p.communicate(timeout=3))
  def kill(self,p):
