@@ -1,4 +1,4 @@
-from test_flow import Case,ok,fail
+from test_flow import Case,ok,fail,extend_cycle,verify_complete
 from pathlib import Path
 import sqlite3
 
@@ -6,7 +6,19 @@ import sqlite3
 c=Case();p=c.start('1',BLOCK_STAGE='implement');c.ready(p);c.enqueue('DEFERRED');c.kill(p)
 ok(c.run('1'));assert c.rows()[0]['state']=='pending'
 assert all('DEFERRED' not in e['prompt'] for e in c.events() if e['kind'] in ('review','plan'))
-ok(c.run('1'));assert c.rows()[0]['state']=='archived'
+
+ok(c.run('1'));assert c.rows()[0]['state']=='pending'
+
+extend_cycle(c)
+assert c.rows()[0]['state']=='active'
+assert any(
+ 'DEFERRED' in e['prompt']
+ for e in c.events()
+ if e['kind'] in ('review','plan')
+)
+
+verify_complete(c)
+assert c.rows()[0]['state']=='archived'
 print('PASS empty interrupted cycle defers input until following run');c.close()
 
 # Migration: exported legacy state has no queue fields and is already implementing.
@@ -26,18 +38,18 @@ ok(c.run('1'))
 assert len([e for e in c.events() if e['kind']=='review'])==2
 print('PASS stale review log cannot satisfy an active instruction batch');c.close()
 
-# Correct stamped review can be recovered when its cache disappears.
+# Logs retain evidence; only an atomically written valid cache can authorize Plan.
 c=Case();c.enqueue('RECOVER_REVIEW');p=c.start('1',BLOCK_STAGE='plan');c.ready(p);c.kill(p)
 (c.a/'current-review').unlink();ok(c.run('1'))
-assert len([e for e in c.events() if e['kind']=='review'])==1
-print('PASS missing cache recovered from matching stamped review');c.close()
+assert len([e for e in c.events() if e['kind']=='review'])==2
+print('PASS missing cache requires fresh read-only Review');c.close()
 
 # Simulate process death after archive transaction commits but before state advances.
-c=Case();c.enqueue('ARCHIVE_ONCE')
+c=Case();c.enqueue('ARCHIVE_ONCE');ok(c.run('1'))
 helper=c.p/'instructions.py';original=helper.read_text()
 helper.write_text(original.replace("elif c=='complete':q.complete(v[0],v[1])", "elif c=='complete':\n            q.complete(v[0],v[1]);raise RuntimeError('simulated post-archive interruption')"))
-fail(c.run('1'));assert c.rows()[0]['state']=='archived';assert 'STAGE=checkpoint_done' in (c.a/'resume-state').read_text()
-c.enqueue('NEXT_BATCH');helper.write_text(original);events=c.events();ok(c.run('1'));assert c.events()==events
+fail(c.run('2','--extend-budget',REVIEW_STATUS='DONE',INPUT_STATUS_OVERRIDE='COMPLETE'));assert c.rows()[0]['state']=='archived';assert 'STAGE=review_done' in (c.a/'resume-state').read_text()
+c.enqueue('NEXT_BATCH');helper.write_text(original);events=c.events();ok(c.run('2'));assert c.events()==events
 assert [r['state'] for r in c.rows()]==['archived','pending']
 print('PASS post-archive interruption is idempotent and leaves next batch pending');c.close()
 
@@ -48,7 +60,15 @@ assert not (c.repo/'SHOULD_NOT_EXIST').exists() and not (c.repo/'ALSO_NOT').exis
 assert c.rows()[0]['text']==payload
 print('PASS instruction text is preserved without shell evaluation');c.close()
 
-# Actual checkpoint branch creation is preserved.
+# The controller refuses to sweep a feature-branch baseline into a checkpoint.
 c=Case(initial='feature/test');c.enqueue('branch behavior');ok(c.run('1'))
-assert c.git('branch','--show-current').startswith('checkpoint/') and c.rows()[0]['state']=='archived'
-print('PASS existing checkpoint branch creation preserved');c.close()
+assert c.git('branch','--show-current')=='feature/test' and c.rows()[0]['state']=='active'
+assert (c.a/'candidate.json').exists() and c.git('status','--porcelain')
+print('PASS guarded feature-branch work retained for owner reconciliation');c.close()
+
+# Standalone checkpoint still creates a checkpoint branch, as before.
+import subprocess
+c=Case(initial='feature/test');(c.repo/'RESULT.md').write_text('manual checkpoint')
+r=subprocess.run([str(c.bin/'checkpoint')],cwd=c.repo,env=c.env,capture_output=True,text=True,timeout=30);ok(r)
+assert c.git('branch','--show-current').startswith('checkpoint/') and c.git('status','--porcelain')==''
+print('PASS standalone checkpoint branch creation preserved');c.close()

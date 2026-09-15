@@ -19,8 +19,7 @@ fi
 ENGINE="$HOME/.autocycle/stage"
 ADJUDICATOR="$HOME/.autocycle/adjudication.py"
 adjudication() { python3 "$ADJUDICATOR" "$@"; }
-NO_PROGRESS_LIMIT="${AUTOCYCLE_NO_PROGRESS_LIMIT:-3}"
-[[ "$NO_PROGRESS_LIMIT" =~ ^[1-9][0-9]*$ ]] || { echo "AUTOCYCLE_NO_PROGRESS_LIMIT must be a positive integer."; exit 1; }
+progress() { python3 "$(dirname "$ADJUDICATOR")/progress.py" "$@"; }
 
 usage() {
     echo "Usage:"
@@ -733,6 +732,8 @@ else
     save_state
 fi
 
+progress recover "$STAGE" "${PLAN_SHA:-}" "${IMPLEMENT_BASE_SHA:-}" "${INPUT_CYCLE_ID:-}" || fail "cannot migrate pending work identity; evidence preserved."
+
 LAST_PRINTED_CYCLE=0
 
 while (( RUN_CYCLE <= RUN_MAX )); do
@@ -749,6 +750,7 @@ while (( RUN_CYCLE <= RUN_MAX )); do
         save_state
     fi
     if [[ "$STAGE" == checkpoint_done ]]; then
+        progress checkpoint "${BOUNDARY_KIND:-checkpoint}" "${INPUT_CYCLE_ID:-}" || fail "cannot persist checkpoint attempt; evidence preserved."
         if (( RUN_CYCLE >= RUN_MAX )); then
             if [[ "${BOUNDARY_KIND:-checkpoint}" == checkpoint ]]; then
                 echo "Run limit reached; checkpoint saved; review pending."
@@ -773,6 +775,15 @@ while (( RUN_CYCLE <= RUN_MAX )); do
         BOUNDARY_KIND=checkpoint
         PLAN_SHA=""
         # Keep IMPLEMENT_BASE_SHA until protected-document verification before Plan.
+        save_state
+        continue
+    fi
+
+    # New recovery instructions enter through the existing immutable batch boundary.
+    # They trigger fresh Review, but never clear the durable progress block themselves.
+    if [[ "$STAGE" == review_done || "$STAGE" == start || "$STAGE" == reviewing ]] && progress blocked && (( $(input_queue pending-count) > 0 )); then
+        STAGE=boundary_input
+        NEXT_INPUT_ID=$(input_queue new-id)
         save_state
         continue
     fi
@@ -914,6 +925,24 @@ while (( RUN_CYCLE <= RUN_MAX )); do
                 true
             )
 
+            set +e
+            PROGRESS_DECISION=$(progress guard "$CACHE" "${INPUT_CYCLE_ID:-}")
+            PROGRESS_RC=$?
+            set -e
+            if [[ "$PROGRESS_RC" == 4 ]]; then
+                echo "Review      ↪ $PROGRESS_DECISION"
+                rm -f "$CACHE"
+                STAGE=start
+                save_state
+                continue
+            fi
+            if [[ "$PROGRESS_RC" == 2 ]]; then
+                echo "BLOCKED     $PROGRESS_DECISION"
+                echo "    Queue a concrete revised approach or a new evidence path with autocycle --instruct."
+                exit 2
+            fi
+            [[ "$PROGRESS_RC" == 0 ]] || fail "cannot persist progress decision; evidence and input preserved."
+
             if [[ -n "${INPUT_CYCLE_ID:-}" && "$(sed -n 's/^INPUT_STATUS: //p' "$CACHE")" == COMPLETE ]]; then
                 input_queue complete "$INPUT_CYCLE_ID" "$(head_sha)" \
                     || fail "instruction archival failed; valid opening Review and input preserved."
@@ -937,17 +966,6 @@ while (( RUN_CYCLE <= RUN_MAX )); do
                 exit 2
             fi
 
-            if [[ -f "$AC_DIR/candidate.json" ]]; then
-                set +e
-                COUNT=$(AUTOCYCLE_INPUT_BATCH="${INPUT_CYCLE_ID:-}" adjudication count "$CACHE" "$NO_PROGRESS_LIMIT")
-                RC=$?
-                set -e
-                if [[ "$RC" -eq 3 ]]; then
-                    echo "Stopped     no progress after $COUNT equivalent opening Reviews; evidence and input preserved."
-                    exit 2
-                fi
-                [[ "$RC" -eq 0 ]] || fail "cannot persist no-progress guard."
-            fi
             if dirty || [[ "$(remote_sha)" != "$(head_sha)" ]]; then
                 fail "local work is not safely checkpointed/published; read-only Review retained. Reconcile Git/ownership before Plan. Logs: $AC_DIR"
             fi

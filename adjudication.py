@@ -10,7 +10,8 @@ import sqlite3
 import subprocess
 import sys
 
-POLICY = 'five-stage-v2'
+POLICY = 'five-stage-progress-v3'
+import progress
 
 def git(*args):
     return subprocess.check_output(['git', *args], stderr=subprocess.PIPE)
@@ -64,7 +65,9 @@ def input_context(batch):
 
 def identity(batch):
     ac = location()
-    evidence = {}
+    with progress.state() as work_state:
+        work_binding = progress.binding(work_state)
+    evidence = {'work_binding': digest(progress.encoded(work_binding).encode())}
     for name in ('candidate.json', 'latest-implementation', 'implementation-result.json'):
         evidence[name] = digest(read(ac/name))
     instructions=input_context(batch)['items']
@@ -88,6 +91,9 @@ def valid(path, batch):
         f = fields(path)
         lines=path.read_text().splitlines()
         if any(sum(line.startswith(k+': ') for line in lines)!=1 for k in f):return False
+        with progress.state() as work_state:
+            progress.review_report(work_state, path.read_text())
+        if not f.get('REVIEW_TOKEN'): return False
         return (f.get('REVIEW_POLICY') == POLICY and f.get('REVIEW_IDENTITY') == identity(batch)
             and f.get('CACHE_BRANCH') == git('branch','--show-current').decode().strip()
             and f.get('REVIEWED_SHA') == git('rev-parse','HEAD').decode().strip()
@@ -133,8 +139,23 @@ def main():
             atomic(p, {'head':git('rev-parse','HEAD').decode().strip(),
                 'branch':git('branch','--show-current').decode().strip(),
                 'clean':not bool(git('status','--porcelain')), 'files':files()})
-        elif git('status','--porcelain'):
-            b=json.loads(p.read_text());b['clean']=False;atomic(p,b)
+        # This is the state before the first provider invocation, not before
+        # each retry. Interrupted implementation leaves its own edits dirty;
+        # changing clean here would misclassify them as pre-existing work.
+        # Keep an existing baseline immutable, including clean=False from older
+        # releases: matching worktree fingerprints cannot prove a clean index.
+        b=json.loads(p.read_text())
+        if (b['head']!=git('rev-parse','HEAD').decode().strip()
+                or b['branch']!=git('branch','--show-current').decode().strip()):
+            raise ValueError('implementation baseline no longer matches HEAD/branch; work preserved for reconciliation')
+        if not b['clean']:
+            raise ValueError('implementation baseline has unresolved ownership; reconcile preserved work before retrying')
+        if git('status','--porcelain'):
+            # There is no trusted post-shutdown fingerprint. Dirty files may be
+            # provider work, edits made while paused, or both. Stop before a
+            # resumed provider can absorb them into a fresh result snapshot.
+            raise ValueError('interrupted implementation has uncheckpointed changes with unverified ownership; '
+                             'work and original baseline preserved; reconcile before resuming')
     elif cmd == 'implementation-result':
         atomic(ac/'implementation-result.json',{'head':git('rev-parse','HEAD').decode().strip(),
             'branch':git('branch','--show-current').decode().strip(),'files':files()})
@@ -167,38 +188,9 @@ def main():
         # Keep an immutable copy for subsequent diagnoses, even when a newer candidate replaces the pointer.
         atomic(ac/('candidate-'+digest(json.dumps(record,sort_keys=True).encode())+'.json'),record)
         atomic(ac/'candidate.json',record)
-    elif cmd == 'count':
-        cache=Path(args[0]); limit=int(args[1])
-        if limit < 1: raise ValueError('no-progress limit must be positive')
-        f=fields(cache);p=ac/'blocker-progress.json'
-        old=json.loads(p.read_text()) if p.exists() else {}
-        # HEAD and generated plans/results are deliberately absent: plan churn is not progress.
-        key=re.sub(r'\s+',' ',f.get('BLOCKER_KEY','').lower()).strip()
-        if not key: raise ValueError('adjudication missing BLOCKER_KEY')
-        code=digest(json.dumps(files(True),sort_keys=True).encode())
-        branch=git('branch','--show-current').decode().strip()
-        scope=[branch,digest(json.dumps(input_context(os.environ.get('AUTOCYCLE_INPUT_BATCH',''))['items'],sort_keys=True).encode())]
-        decision=digest(read(cache))
-        if old.get('decision') != decision:
-            n=old.get('count',0)+1 if old.get('key')==key and old.get('code')==code and old.get('scope')==scope else 1
-            old={'key':key,'code':code,'scope':scope,'count':n,'decision':decision}
-            atomic(p,old)
-        print(old['count'])
-        sys.exit(3 if old['count']>=limit else 0)
     elif cmd == 'numbering':
-        # Inspect all reachable plan contents, not just titles or a truncated history.
-        ids=set()
-        for rev in git('rev-list','--all','--','IMPLEMENTATION.md').decode().splitlines():
-            blob=subprocess.run(['git','show',rev+':IMPLEMENTATION.md'],capture_output=True)
-            ids.update(re.findall(r'\b\d+[A-Z]+(?:\.\d+[A-Z]*)*\b',blob.stdout.decode(errors='replace')))
-        ids.update(re.findall(r'\b\d+[A-Z]+(?:\.\d+[A-Z]*)*\b',read(Path('IMPLEMENTATION.md')).decode(errors='replace')))
-        print('Previously used IDs (do not reuse for new work): '+', '.join(sorted(ids)))
-        title=read(Path('IMPLEMENTATION.md')).decode(errors='replace').splitlines()
-        match=re.search(r'\b\d+[A-Z]+(?:\.\d+[A-Z]*)*\b',title[0] if title else '')
-        if match:
-            parent=match.group(); n=1
-            while parent+'.'+str(n) in ids:n+=1
-            print('First unused child of '+parent+': '+parent+'.'+str(n))
+        with progress.state() as work_state:
+            print(progress.encoded(progress.context(work_state, '')))
     else: raise ValueError('unknown adjudication operation')
 
 if __name__ == '__main__':

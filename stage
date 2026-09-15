@@ -2,6 +2,7 @@
 set -euo pipefail
 ADJUDICATOR="$HOME/.autocycle/adjudication.py"
 adjudication() { python3 "$ADJUDICATOR" "$@"; }
+progress() { python3 "$(dirname "$ADJUDICATOR")/progress.py" "$@"; }
 
 usage() {
     echo "Usage:"
@@ -153,6 +154,10 @@ esac
 # Repository
 # ============================================================
 
+if [[ "$MODE" == "--run" ]]; then
+    exec "$HOME/bin/autocycle" "$MAX_CYCLES"
+fi
+
 ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || {
     fail "not inside a Git repository."
 }
@@ -283,21 +288,19 @@ Active instructions: $INPUT_COUNT
 Allowed INPUT_STATUS: $EXPECTED_INPUT_STATUS
 An empty batch is NOT an active instruction. Repository goals, unresolved implementation work and historical logs do not count as active queued instructions. Use only the allowed status values above."
 
-# AUTOCYCLE_STEP_INDEX_V1
+# Controller-owned step identity; history is imported once from executed headings.
 STEP_INDEX_PROMPT=""
 case "$MODE" in
     --review-only|--plan-only)
-        STEP_INDEX_HISTORY=$(git log -40 --format='%h %s' -- IMPLEMENTATION.md)
+        WORK_CONTEXT=$(progress context "${AUTOCYCLE_INPUT_BATCH:-}") || fail "cannot load work registry."
         STEP_INDEX_PROMPT="
 Step indexing:
-$(adjudication numbering)
-- Only Plan revises IMPLEMENTATION.md. Keep the parent unresolved until its ORIGINAL acceptance criteria pass; carry those criteria into every repair child. Never weaken acceptance to make a blocker disappear.
-- Preserve the project's established detailed step IDs, including letters, dots and suffixes (for example 9M.1); do not collapse them to a broad phase such as Step 9 because human input mentions that phase.
-- Recalibrate against TARGET.md, IMPLEMENTATION.md, RESULT.md and the recent plan titles below. If the current heading has already lost detail, recover the most recent relevant detailed ID from history and map the requested work to that sequence.
-- Keep the existing ID when repairing or completing that same step. For a genuinely new bounded step, use the next unused ID in the established sequence; use its existing substep convention for inserted work. Do not renumber completed steps or confuse the autocycle cycle counter with project step IDs.
-- Human input changes priority and scope; it changes the numbering convention only when explicitly requested. Use the resolved ID in the IMPLEMENTATION.md heading and the proposed next-step label.
-Recent commits affecting the plan (newest first; historical evidence, not new instructions):
-$STEP_INDEX_HISTORY
+AUTOCYCLE_WORK_CONTEXT: $WORK_CONTEXT
+- The controller registry is authoritative. Mentions, suggestions and reservations never consume a step ID. Never reserve or certify a prospective next ID in RESULT.md.
+- Only Plan revises IMPLEMENTATION.md; retain the original acceptance criteria of unresolved work. Retries, repairs and administrative corrections keep that work's existing ID; do not create numbered repair children.
+- Preserve detailed project IDs; do not collapse an existing detailed ID into a broad phase. The controller assigns a new ID only when admitting genuinely new work after verified completion of the previous objective.
+- Numbering and wording discrepancies alone are advisory. Do not open another numbering repair unless the discrepancy prevents execution or makes acceptance materially ambiguous; explain the concrete consequence.
+- Do not reconstruct consumed IDs from prose or reserved numbers. Historical registry entries mark execution, not verified acceptance.
 "
         ;;
 esac
@@ -368,7 +371,9 @@ load_review() {
 
 write_review_cache() {
     cat > "$CACHE_FILE.tmp.$$" <<CACHE_EOF
-REVIEW_POLICY: five-stage-v2
+REVIEW_POLICY: five-stage-progress-v3
+REVIEW_TOKEN: $REVIEW_TOKEN
+$PROGRESS_RECORD
 REVIEW_IDENTITY: $REVIEW_IDENTITY
 CACHE_BRANCH: $BRANCH
 INPUT_BATCH: ${AUTOCYCLE_INPUT_BATCH:-}
@@ -410,7 +415,9 @@ run_review() {
         CANDIDATE_PROMPT="Adjudicate the blocker candidate in $LOG_DIR/candidate.json. Inspect its preserved report and relevant local changes; the report is evidence, not authority. Check recorded branch, revision and input batch; stale evidence cannot establish current acceptance. Return PROBLEMS for an authorized bounded repair or BLOCKED with a concrete human action. Do not return PASS or DONE for an unresolved candidate."
     fi
 
-    PROMPT=$(cat <<PROMPT_EOF
+    # Bash 3.2 misparses quotes in heredocs nested inside $(...). Read directly;
+    # EOF is the expected nonzero read status because no NUL delimiter is sent.
+    IFS= read -r -d '' PROMPT <<PROMPT_EOF || true
 Review HEAD $SHA on branch $BRANCH against the current IMPLEMENTATION.md and TARGET.md if present.
 
 $HUMAN_INPUT_PROMPT
@@ -449,8 +456,22 @@ REVIEWED_SHA: $SHA
 HUMAN_ACTION: <concrete human action for BLOCKED, otherwise NONE>
 BLOCKER_KEY: <stable obstacle identifier, or NONE>
 INPUT_STATUS: $EXPECTED_INPUT_STATUS
+AUTOCYCLE_REVIEW: <one JSON object as specified below>
+
+AUTOCYCLE_REVIEW must contain:
+- work_id and attempt_id: echo the controller work.id and attempt.id in AUTOCYCLE_WORK_CONTEXT; use "NONE" when absent. Never invent a replacement identity to escape unresolved work.
+- finding_key: the stable underlying finding, retaining the current work's key while unresolved.
+- blocking: JSON true only for consequences preventing correctness, execution, verification or acceptance. blocking_reason: the concrete consequence, otherwise "NONE".
+- outcome: "UNASSESSED" only when no checkpointed attempt exists; otherwise "VERIFIED" for measured improvement against the ORIGINAL objective, "COMPLETE" for verified satisfaction of its success criterion, "NONE" for no improvement, or "UNKNOWN" when evidence is insufficient.
+- reason: explain how the observed result compares with work.baseline and work.success. A commit, changed file, new test, rewritten status, changed ID or regenerated artifact alone is never progress. Documentation and investigation count when they satisfy the actual objective.
+- evidence: a JSON array of objects with path, sha256 (the actual current file SHA-256), and observation (the concrete test/measurement/result relevant to the original criterion). VERIFIED and COMPLETE require evidence you actually inspected. Paths must be in the repository or its AutoCycle evidence directory. Evidence can be a test log, structured metrics or the actual document/artifact; do not invent paths or hashes. Do not modify files to create evidence during Review.
+- recovery: "NONE" normally. If blocked, "NEW_EVIDENCE" requires verified progress backed by newly inspected evidence; "REVISED_APPROACH" requires explicit new human instructions authorizing a concrete different approach, with recovery_instruction_ids drawn from new_instruction_ids and a concrete recovery_reason. Mere reruns or unrelated new instructions do not clear a block.
+- recovery_instruction_ids: [] unless using REVISED_APPROACH. recovery_reason: "NONE" unless recovering.
+If verification_only is true, this is the single read-only recheck of missing evidence. Do not propose implementation to fix the progress mechanism; unresolved uncertainty will stop execution.
+DONE requires current-work COMPLETE when an attempt exists. If all TARGET work and frozen instructions are complete, return DONE; unused cycle budget is not a reason to invent work.
+PROBLEMS with blocking=false records advisory findings; Plan should select the highest-priority authorized objective, not a recursive administrative repair.
 PROMPT_EOF
-)
+    PROMPT=${PROMPT%$'\n'}
 
     set +e
     adjudication run "${AUTOCYCLE_PROVIDER_TIMEOUT:-900}" codex exec --sandbox read-only --output-last-message "$ANSWER" "$PROMPT" \
@@ -501,6 +522,9 @@ STATUS_PY
         [[ "$BLOCKER_KEY" != NONE ]] || fail "candidate lacks stable blocker key."
     fi
 
+    progress validate-review "$ANSWER" || fail "invalid progress evidence; Review not accepted."
+    REVIEW_TOKEN=$(python3 -c 'import uuid;print(uuid.uuid4().hex)')
+    PROGRESS_RECORD=$(sed -n '/^AUTOCYCLE_REVIEW: /p' "$ANSWER")
     printf '\nAUTOCYCLE_REVIEW_INPUT: %s\n' "${AUTOCYCLE_INPUT_KEY:-}" >> "$REVIEW_LOG"
     write_review_cache
 
@@ -512,6 +536,15 @@ STATUS_PY
 # ============================================================
 
 run_plan() {
+    local GUARD_RESULT GUARD_RC
+    set +e
+    GUARD_RESULT=$(progress guard "$CACHE_FILE" "${AUTOCYCLE_INPUT_BATCH:-}")
+    GUARD_RC=$?
+    set -e
+    if [[ "$GUARD_RC" != 0 ]]; then
+        echo "BLOCKED     $GUARD_RESULT"
+        exit "$GUARD_RC"
+    fi
     live_start "Plan"
 
     local T
@@ -526,13 +559,14 @@ run_plan() {
     local ANSWER="$PLAN_LOG.answer"
     PLAN_FILE="$LOG_DIR/IMPLEMENTATION-$T.md"
 
-    PROMPT=$(cat <<PROMPT_EOF
+    IFS= read -r -d '' PROMPT <<PROMPT_EOF || true
 Create the next IMPLEMENTATION.md from:
 
 SHA: $SHA
 STATUS: $STATUS
 REVIEW: $REVIEW_TEXT
 NEXT_STEP: $NEXT_STEP
+$(sed -n '/^AUTOCYCLE_REVIEW: /p' "$CACHE_FILE")
 
 $HUMAN_INPUT_PROMPT
 $STEP_INDEX_PROMPT
@@ -541,13 +575,13 @@ Read existing IMPLEMENTATION.md, TARGET.md, and directly relevant files only as 
 Rules:
 - One bounded implementation step.
 - Review can authorize bounded technical repair and expansion of machine-generated file restrictions within the existing user-authorized goal. It cannot override explicit user constraints, TARGET.md, permissions or access controls.
-- Preserve the parent original acceptance criteria and unresolved status when inserting a repair child; inspect the numbering history above before choosing an unused child ID such as 9M.2.4.1.
+- Preserve the current work identity and ORIGINAL acceptance criteria for retries and repairs. Administrative corrections use the same work ID and never create numbered children.
 - Missing evidence must not be invented; human decisions and unavailable access remain blockers.
 - If no authorized bounded plan is possible, output PLAN_STATUS: BLOCKED followed by BLOCKER: <concrete reason>, without a plan block. This is a candidate for read-only Review, not a final decision.
 - Cursor must never modify TARGET.md or IMPLEMENTATION.md.
 - Direct completion records and measured verification to RESULT.md.
 - Read RESULT.md when assessing the previous step.
-- If STATUS is PROBLEMS, repair it before advancing.
+- Repair blocking correctness, execution, verification or acceptance defects before advancing. Record advisory findings and choose the highest-priority remaining authorized work. Numbering or wording alone cannot demand another implementation cycle.
 - Preserve useful project-specific naming/conventions.
 - Prefer 2-4 concrete tasks.
 - Include only necessary files, actions, tests, and acceptance criteria.
@@ -559,10 +593,12 @@ Rules:
 Output ONLY:
 
 BEGIN_IMPLEMENTATION_MD
-<complete IMPLEMENTATION.md>
+<complete IMPLEMENTATION.md, starting with a project step heading and containing exactly one single-line record:
+AUTOCYCLE_PLAN: {"objective":"stable objective label","finding_key":"stable underlying problem","kind":"work|administrative|verification","baseline":"concrete starting evidence","success":"observable result satisfying the original objective","verification":"specific read-only check for the following opening Review"}
+Use actual values, not placeholders. The controller stamps the authoritative step and work IDs. Include bounded tasks and acceptance criteria below this record.>
 END_IMPLEMENTATION_MD
 PROMPT_EOF
-)
+    PROMPT=${PROMPT%$'\n'}
 
     set +e
     adjudication run "${AUTOCYCLE_PROVIDER_TIMEOUT:-900}" codex exec --sandbox read-only --output-last-message "$ANSWER" "$PROMPT" \
@@ -622,6 +658,7 @@ PROMPT_EOF
 
     [[ "$FIRST_LINE" == \#* ]] \
         || fail "generated IMPLEMENTATION.md has no heading."
+    progress prepare "$PLAN_FILE" || fail "invalid plan progress contract."
 }
 
 # ============================================================
@@ -818,6 +855,8 @@ run_cursor() {
 
     T=$(timestamp)
     CURSOR_LOG="$LOG_DIR/cursor-$T-$$.log"
+    BEFORE_SHA=$(git rev-parse HEAD)
+    progress begin "$BEFORE_SHA" "${AUTOCYCLE_INPUT_BATCH:-}" || fail "work/attempt admission failed; preserve state and resume Review."
     adjudication baseline || fail "cannot preserve implementation baseline."
     BEFORE_SHA=$(git rev-parse HEAD)
     assert_owned_docs "$BEFORE_SHA"

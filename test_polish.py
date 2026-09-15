@@ -5,6 +5,7 @@ c=Case()
 try:
  (c.repo/'IMPLEMENTATION.md').write_text('# Step 9M.12 — prior detailed step')
  c.git('add','IMPLEMENTATION.md');c.git('commit','-qm','Plan: Step 9M.12 — prior detailed step');c.git('push','-q')
+ (c.repo/'RESULT.md').write_text('Executed detailed step');c.git('add','RESULT.md');c.git('commit','-qm','Step 9M.12');c.git('push','-q')
  (c.repo/'IMPLEMENTATION.md').write_text('# Step 9 — heading lost detail')
  c.git('add','IMPLEMENTATION.md');c.git('commit','-qm','Plan: Step 9 — heading lost detail');c.git('push','-q')
  # A non-Plan checkpoint avoids intentionally inferring an existing plan.
