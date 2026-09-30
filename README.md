@@ -1,75 +1,181 @@
-# autocycle
+# AutoCycle
 
-macOS automation: Codex Review → Plan → Sync → Cursor ACP Implement → Checkpoint.
+AutoCycle orchestrates work on a target Git project such as BAV. It keeps a durable Session, admits bounded implementation work, and returns each result to independent Review.
 
-This revision builds on the exact local runtime snapshot at ccd5f25, including the five-stage recovery contract and the completed legacy test migration.
+```text
+BAV / target project
+        ↑
+AutoCycle
+  ├── Controller
+  ├── Reviewer
+  ├── Planner
+  ├── Implementer
+  └── Observer
+       └── Office Bridge implementation
+```
 
-## Files and installed locations
+| Component | Authority | Does not own |
+|---|---|---|
+| Controller | Lifecycle, durable state, transitions, output admission, instructions, ownership, access, capabilities, retries, recovery, clocks, Baseline, Checkpoint, retention | Semantic truth, acceptance, or implementation strategy |
+| Reviewer | Material requirements, relevance, evidence sufficiency and aggregation, Completion and Session Endpoint judgments | Product edits, implementation mechanics, or Controller protocols |
+| Planner | Smallest useful supported route from unresolved material findings, respecting Session Priority and dependencies | Final acceptance or invented capabilities; does not call Observer |
+| Implementer | Execution of the admitted Plan, product changes, supported checks, measured results | Redefining acceptance or certifying its own final acceptance |
+| Observer | Authenticated native/external observations, actions, images, receipts and diagnostics | Semantic acceptance or workflow advancement |
 
-| Source | Installed location |
-| --- | --- |
-| autocycle | ~/bin/autocycle |
-| stage | ~/.autocycle/stage |
-| instructions.py | ~/.autocycle/instructions.py |
-| adjudication.py | ~/.autocycle/adjudication.py |
-| migration.py | ~/.autocycle/migration.py |
-| progress.py | ~/.autocycle/progress.py |
-| sync | ~/bin/sync |
-| checkpoint | ~/bin/checkpoint |
+There are exactly three recurring stages:
 
-Keep these files together in a dedicated repository. Dependencies include Bash, Python 3 (SQLite), Node, Git, authenticated Codex and Cursor CLIs, and the existing network/VPN tools referenced by the scripts. macOS caffeinate is used while a run is active.
+```text
+Review → Plan → Implement → next Review
+```
 
-## Usage
+Controller governs transitions. A cycle allowance limits work; exhausting it does not declare the Session complete. Reviewer alone decides whether the Endpoint has been reached. A cycle can finish after Review or Plan without inventing later stages.
 
-Run commands inside the project Git repository:
+## Observation
 
-```bash
-autocycle 50
-autocycle --instruct 'Your direction for the next new cycle'
-autocycle --instructions
-autocycle --cancel-instruction INSTRUCTION_ID
+Office Bridge implements Observer for opted-in Word and Excel projects. Reviewer may request supported read-only inspection of checkpointed artifacts. Implementer may request observations that help execute the current admitted Plan. Observer returns to the same caller, cycle and work identity; its time belongs to that stage.
+
+```text
+Review    → Observe Word / Observe Excel → same Review
+Implement → Observe Word / Observe Excel → same Implement
+```
+
+A provider requests an observation with a single `OBSERVER_REQUEST` response containing a finite `requests` array. Each request identifies an enabled app, source and actual source SHA-256; Excel also requires a worksheet. Existing supported capture/navigation fields remain available. Controller authenticates the request and project boundary, dispatches Observer, and continues the caller. An observation request is not a final stage result.
+
+Reviewer first considers applicable existing evidence and supported read-only observation. It may reuse Implement observations when the relevant final artifact and dependencies remain unchanged. Later Review time alone does not invalidate evidence. Changed sources, missing retained artifacts, mismatched hashes or ownership cannot establish acceptance. Capture success alone never establishes readability or other semantic facts.
+
+Native interaction uses owned fixed Office slots. User documents and immutable evidence are not opened for mutation. Requests, receipts, screenshots and source bindings remain authenticated. Capture failures are technical observations, not automatic product defects, human blockers or capability absence.
+
+New work never writes `NATIVE_HANDOFF` or `native-handoff.json`. Controller retains an authenticated reader for saved legacy handoffs. Older deferred observation associations migrate once to ordinary Review with provenance and prior substantive blocks retained; they do not automatically execute an old request. Interrupted current calls retain their exact caller and snapshot in `observer-call.json`; continuation validates those bindings before returning to that caller.
+
+## Timing and output
+
+Access runs once per process invocation, including a fresh `--resume`, when the project requires an Office access check. It is outside Cycle.
+
+```text
+Access      ✓ 00:08
+
+Cycle       18/50
+
+Review      ✓ 05:44
+    ✓ Observe Word
+    ✓ Found   Required issue remains
+    ✓ Pruned  2 files · 100 B
+Plan        ✓ 01:12
+    ✓ Planned Step 1.18 — Bounded repair
+    ✓ Baseline abc1234
+Implement   ✓ 08:31
+    ✓ Modify publication
+    ✓ Run tests
+    ✓ Checkpoint def5678
+Cycle          15:27
+```
+
+Controller owns one identity and one active clock for each entered stage. Model calls, corrections, Controller validation and persistence, Observer calls and continuation all share it. Review includes pruning; Plan includes Baseline; Implement includes Checkpoint. Renderer restarts do not restart the clock.
+
+```text
+Cycle = Review + Plan + Implement
+```
+
+This equality always applies to displayed active durations, including cycles with interruptions. For early exits, only entered stages contribute. Cycle measures active cycle work, not elapsed wall time. Access and Network are excluded. Run wall time additionally includes Access, Network and startup/exit overhead.
+
+Network is a standalone interruption record, not a component, stage or subphase. A genuine transport interruption pauses the current stage clock. Its own timer updates in place, with one blank line before and after the unindented row. Recovery resumes the same stage; the completed Network block remains in chronological position. Each distinct interruption has its own block.
+
+```text
+Implement   ✓ 06:04
+    ✓ Modify publication
+    ✓ Observe Word
+
+Network     ✓ 00:31
+
+    ✓ Run tests
+    ✓ Checkpoint abc1234
+```
+
+Retry exhaustion marks the current Network record `✗ … retry exhausted` and preserves interrupted work. It does not turn transport failure into a substantive failed Review. Semantic/model errors, invalid responses, Office errors, failed project tests, access failures and capability gaps are not Network.
+
+Git publication retries use the same interruption accounting and push an immutable commit identity. Bounded provider-capacity retries preserve partial-work safeguards but remain active Implement time; they are not Network interruptions.
+
+Non-TTY output is append-only and contains no cursor controls. An interrupted stage prints its header once, Network start/outcome records, then a `✓ Review active MM:SS` (or the corresponding caller/status) continuation result. Active stage duration remains separate from Network duration.
+
+## Authenticated boundaries
+
+There are two implementation boundaries:
+
+1. **Baseline**, under Plan: the exact published Planner-approved commit, branch and clean project snapshot from which Implementer is authorized to work. Controller synchronization pins that commit and branch.
+2. **Checkpoint**, under Implement: the exact durable implementation result for the next Reviewer. Controller rechecks ownership and frozen result files around staging and verifies publication.
+
+Dirty initial worktrees, changed protected documents, changed indexes, unknown partial work and mismatched recovery receipts fail closed. `TARGET.md`, `SESSION.md` and `IMPLEMENTATION.md` are read-only to Implementer. A provider completion marker does not authorize acceptance or bypass Checkpoint safety.
+
+Reviewer states unresolved material facts. Planner supplies finite supported routes, preferring valid existing evidence before new observations or product changes. Controller checks executability before Implement. An unsupported material route stops with a verification-capability gap; an available mechanism that fails at runtime remains a technical failure. New `unclassified` requirements, prose-derived execution state and generic matching-receipt acceptance are rejected.
+
+## Project documents and state
+
+- `TARGET.md`: project direction.
+- `SESSION.md`: current Endpoint and Priority.
+- `IMPLEMENTATION.md`: the current admitted bounded Plan and Completion.
+- `RESULT.md`: measured implementation results when needed.
+
+Controller state lives in the target project's `.git/autocycle/`:
+
+| File | Purpose |
+|---|---|
+| `resume-state` | Session, cycle budget and durable routing boundary |
+| `work-state.json` | Work/attempt identities, Review assessments, admitted routes and observation references |
+| `instructions.sqlite3` | Immutable instruction delivery batches and receipts |
+| `current-review` | Authenticated current Review decision |
+| `planned-commit` | Exact Plan publication identity retained across interruption before Baseline |
+| `implementation-baseline.json` | Exact initial ownership snapshot |
+| `implementation-result.json` | Frozen provider result for Checkpoint |
+| `implementation-interruption.json` | Single-use authenticated transport recovery |
+| `observer-call.json` | Pending/returned same-stage observation and caller snapshot |
+| `office/requests`, `office/receipts`, `office/evidence` | Authenticated Observer inputs, outcomes and retained artifacts |
+
+Display files and terminal anchors are ephemeral presentation/accounting data. They never establish project truth, acceptance or workflow authority. Controller retains supported saved-state migration readers; historical evidence is not rewritten to manufacture acceptance.
+
+## Commands
+
+Run commands inside the target Git repository:
+
+```sh
+autocycle 5
+autocycle --resume
+autocycle --extend 5
+autocycle 5 --restart --instruct 'Endpoint: deliver the next capability'
 autocycle --stop
+autocycle --instruct 'Prioritize the end-to-end workflow'
+autocycle --instructions
+autocycle --cancel-instruction <id>
+autocycle 1 --dry-run
 ```
 
-Stop finishes the current stage and preserves resume state; it does not forcibly terminate a hung provider. Resume with the original cycle-count command. Inputs submitted during a cycle wait for the next new cycle. Active inputs survive restarts and are archived only when the next opening Review verifies completion. A run that reaches its budget at Checkpoint retains review-pending state; use `autocycle <larger-total> --extend-budget` to continue. TARGET.md and IMPLEMENTATION.md are read-only to Cursor. Measured results belong in RESULT.md.
+`--resume` keeps the saved budget and work identity. `--extend` adds cycles. `--stop` requests a pause after the current checkpoint and bookkeeping. An unfinished Session requires resume, extension or explicit restart. Restart preserves owned partial work and history before starting a new Session. Instruction delivery alone does not prove project completion.
 
-An interrupted implementation retains the original ownership baseline. If interrupted before editing files, it can resume normally. If it leaves uncheckpointed changes, AutoCycle stops before rerunning the provider: there is no trusted post-shutdown fingerprint to distinguish provider work from edits made while paused. Reconcile that work before resuming. Dirty partial work does not rewrite whether implementation originally started clean. The existing branch, HEAD, protected-document and frozen-result checks still control Checkpoint. Genuinely dirty initial baselines and old baselines already marked uncertain remain blocked; this revision does not rewrite their history or infer index cleanliness from matching file contents. Read-only Review can diagnose preserved work, but Plan still requires safely checkpointed and published work.
+For native Office, opt in through `.autocycle.toml`:
 
-## Objective progress protection
-
-The controller records work IDs, admitted step IDs, execution attempts and progress assessments in `.git/autocycle/work-state.json`. Preparing, mentioning or reserving an ID does not allocate it. Legacy migration imports headings from confirmed executed plans once; it never scans arbitrary body mentions for consumed numbers. Legacy allocation does not certify acceptance.
-
-Plan records the original objective, starting evidence, success criterion and verification method in a single `AUTOCYCLE_PLAN` JSON record. The controller stamps its work and step identities. Retries and administrative corrections preserve those identities and original acceptance criteria. A new step is allocated when its validated plan is admitted for execution.
-
-The following opening Review returns `AUTOCYCLE_REVIEW` alongside the existing short display fields. Review distinguishes blocking consequences from advisory findings and assesses progress against the original objective. Evidence references include the actual file content hashes and observed results. A changed file or commit alone does not establish progress. Documentation and investigation can count when they satisfy the chosen objective. Evidence interpretation remains the responsibility of the read-only reviewer; the controller verifies references, identity, ancestry and durable limits.
-
-Two consecutive checkpointed attempts without verified progress produce `BLOCKED REPEATED_NO_PROGRESS` before another Plan. The fixed limit is two; the old `AUTOCYCLE_NO_PROGRESS_LIMIT` setting is retired. Missing evidence permits one read-only recheck, then produces `BLOCKED PROGRESS_UNKNOWN`. No extra Review is added after Checkpoint. No-change checkpoints and planning candidates are counted, and re-reviewing one attempt does not create another attempt. Previously accepted evidence cannot be alternated to earn repeated progress credit.
-
-Restarting or extending the budget does not clear a block. Queue a concrete revised approach or the path to new evidence with `autocycle --instruct '...'`; the existing batch boundary admits it for a fresh Review. New instructions alone do not reset the guard. Review must validate new evidence or explicitly connect a revised approach to newly queued instruction IDs. Point to new ignored files or `.git/autocycle` logs through this instruction flow so they can be reviewed. Old inputs and evidence remain preserved.
-
-## Installing this revision
-
-Stop active AutoCycle controllers first. Run the version-checked `autocycle-progress-install.py` supplied with this revision. It checks the captured repository and installed runtime hashes, tests an isolated candidate, backs up changed files and replaces each file atomically. It preserves current repository edits, performs no commit/push, and does not run a project cycle. It refuses unrelated source changes. The old `autocycle-polish-fix.py` is retained as historical source and must not be applied to this version.
-
-The shell runtime supports Bash 3.2 and newer. Prompt construction reads heredocs directly, avoiding the Bash 3.2 parser issue with apostrophes inside command-substitution heredocs. The installer checks the actual `/bin/bash` interpreter as well as Bash on PATH before making changes. The shell compatibility test runs real Review/Plan and checkpoint flows with literal instruction punctuation under each selected interpreter.
-
-## Verification
-
-```bash
-bash -n autocycle
-bash -n stage
-bash -n sync
-bash -n checkpoint
-python3 test_queue.py
-python3 test_current_flow.py
-python3 test_flow.py
-python3 test_recovery.py
-python3 test_polish.py
-python3 test_progress.py
-python3 test_resume.py
-python3 test_shell_compat.py
+```toml
+[capabilities]
+native_office = ["word", "excel"]
 ```
 
-Tests use temporary Git repositories and fake providers, not real Codex/Cursor calls. Live macOS/model behavior requires local validation. The registry controls admitted step identities; Review still interprets objective evidence. Existing checkpoint branch-transition crash edges and provider liveness are not claimed to be fully solved.
+Native Office requires macOS, the enabled applications and their permissions. Tests normally use synthetic Office fixtures. `check_word_native.py` and `check_excel_native.py` are explicit live diagnostics, outside the deterministic suite.
 
-Do not upload credentials, queue databases, project working files, run logs or resume-state files with this source. No such runtime state is included here.
+## Source and installation
+
+| Owner | Canonical files |
+|---|---|
+| Controller | `autocycle`, orchestration/admission in `stage`, `adjudication.py`, `progress.py`, `instructions.py`, `migration.py`, `remote_docs.py`, `sync`, `checkpoint`, `stage_display.js`, `implementation_response.js` |
+| Reviewer | Review prompt contract in `stage` |
+| Planner | Plan prompt contract in `stage` |
+| Implementer | Implement prompt contract in `stage` |
+| Observer | `native_office.py`, `excel_verification.py`, `office_capture.swift` |
+
+Physical files need not correspond one-to-one with components. Validators enforce structure, provenance and executability; provider contracts retain the separate semantic and execution authorities.
+
+```sh
+python3 run_tests.py       # isolated deterministic Git/provider/Office fixtures
+python3 install.py --install
+```
+
+The installer checks that controllers are stopped, compiles the native helper, runs the deterministic suite, verifies source stability and installs atomically with backups. `autocycle`, `sync` and `checkpoint` install to `~/bin`; other runtime files and the compiled `autocycle-office-capture` helper install to `~/.autocycle`. Installation does not start a project.
+
+Requires Bash 3.2 or newer, Python 3.11 or newer, Node.js, Git, authenticated Codex and Cursor providers; native capture builds with Apple's Swift tools. Local repair reports, install manifests, caches and diagnostic logs are verification artifacts, not canonical source. Supported installation uses `install.py`, not historical patch installers.

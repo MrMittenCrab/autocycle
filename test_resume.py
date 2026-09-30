@@ -34,14 +34,14 @@ def test_dirty_interruption_stops_before_reexecution():
             events=c.events()
             batch=c.rows()[0]['batch']
             for _ in range(2):
-                r=c.run('2')
+                r=c.run('--resume')
                 fail(r)
                 assert c.events()==events, 'Uncertain resume must stop before rerunning providers'
                 assert c.git('rev-parse','HEAD')==head==c.git('rev-parse','origin/checkpoint/test')
                 assert {p.name:p.read_bytes() for p in c.repo.iterdir() if p.is_file()}==files
                 assert c.git('ls-files','--stage')==index
                 assert (c.a/'implementation-baseline.json').read_bytes()==baseline
-                assert c.rows()[0]['state']=='active' and c.rows()[0]['batch']==batch
+                assert c.rows()[0]['state']=='archived' and c.rows()[0]['batch']==batch
         finally:c.close()
 
 
@@ -97,6 +97,21 @@ def test_edits_after_completed_provider_still_block_checkpoint():
         ok(adjudicate(c,'checkpoint-safe'))
         (c.repo/'private-manual.txt').write_text('Later external work')
         fail(adjudicate(c,'checkpoint-safe'))
+    finally:c.close()
+
+
+def test_existing_manual_checkpoint_is_not_recommitted():
+    c=Case()
+    try:
+        ok(c.run('1'))
+        state=c.a/'resume-state'
+        state.write_text(state.read_text().replace('STAGE=checkpoint_done','STAGE=implement_done'))
+        head=c.git('rev-parse','HEAD');events=c.events()
+        r=c.run('--resume');ok(r)
+        assert c.git('rev-parse','HEAD')==head
+        assert c.events()==events
+        assert 'existing commit preserved' in r.stdout
+        assert 'STAGE=checkpoint_done' in state.read_text()
     finally:c.close()
 
 

@@ -1,5 +1,6 @@
 #!/bin/bash
 set -euo pipefail
+if ! declare -F autocycle_git >/dev/null; then autocycle_git() { command git "$@"; }; fi
 
 ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || {
     echo "Sync failed: not inside a Git repository."
@@ -21,12 +22,12 @@ if [[ -n "$(git status --porcelain)" ]]; then
     exit 1
 fi
 
-if ! git fetch --prune origin >/dev/null 2>&1; then
+if ! autocycle_git fetch --prune origin >/dev/null 2>&1; then
     echo "Sync failed: fetch."
     exit 1
 fi
 
-if [[ "$BRANCH" != "main" ]] \
+if [[ -z "${AUTOCYCLE_BASELINE_SHA:-}" && "$BRANCH" != "main" ]] \
     && git show-ref --verify --quiet refs/remotes/origin/main \
     && git merge-base --is-ancestor HEAD origin/main; then
 
@@ -37,6 +38,15 @@ if [[ "$BRANCH" != "main" ]] \
     fi
 
     BRANCH="main"
+fi
+
+# Controller Baseline pins the exact admitted commit and branch. Standalone
+# synchronization retains its user-facing branch-adoption behavior.
+if [[ -n "${AUTOCYCLE_BASELINE_SHA:-}" ]]; then
+    [[ "$BRANCH" == "${AUTOCYCLE_BASELINE_BRANCH:-}" && "$(git rev-parse "origin/$BRANCH")" == "$AUTOCYCLE_BASELINE_SHA" ]] || {
+        echo "Baseline changed since Plan admission."
+        exit 1
+    }
 fi
 
 if git show-ref --verify --quiet "refs/remotes/origin/$BRANCH"; then

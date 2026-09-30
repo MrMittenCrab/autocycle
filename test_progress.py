@@ -2,23 +2,15 @@
 from test_flow import Case, ok
 
 
-def test_stall_blocks_third_attempt():
+def test_no_progress_is_judged_without_fixed_attempt_limit():
     c=Case()
     try:
         c.enqueue('Repair the actual objective')
-        r=c.run('4',PROGRESS_OUTCOME='NONE')
-        assert r.returncode==2,(r.stdout,r.stderr)
-        assert 'REPEATED_NO_PROGRESS' in r.stdout,(r.stdout,r.stderr)
-        assert len([e for e in c.events() if e['kind']=='implement'])==2
-        assert len([e for e in c.events() if e['kind']=='plan'])==2
-        assert c.rows()[0]['state']=='active'
-        before=c.events()
-        r=c.run('4',PROGRESS_OUTCOME='NONE')
-        assert r.returncode==2,(r.stdout,r.stderr)
-        assert c.events()==before,'Restart must not retry providers or reset the block'
+        ok(c.run('4',PROGRESS_OUTCOME='NONE'))
+        assert len([e for e in c.events() if e['kind']=='implement'])==4
+        assert c.rows()[0]['state']=='archived'
+        before=c.events();ok(c.run('--resume'));assert c.events()==before
     finally:c.close()
-
-
 
 
 def test_incremental_and_documentation_progress():
@@ -43,8 +35,8 @@ def test_unknown_is_bounded():
         assert 'PROGRESS_UNKNOWN' in r.stdout
         assert len([e for e in c.events() if e['kind']=='implement'])==1
         assert len([e for e in c.events() if e['kind']=='review'])==3
-        before=c.events();assert c.run('3',PROGRESS_OUTCOME='UNKNOWN').returncode==2
-        assert c.events()==before
+        before=c.events();assert c.run('--resume',PROGRESS_OUTCOME='UNKNOWN').returncode==2
+        assert c.events()[:-1]==before and c.events()[-1]['kind']=='review'
     finally:c.close()
 
 
@@ -53,32 +45,20 @@ def test_advisory_findings_do_not_force_admin_work():
     try:
         ok(c.run('2',REVIEW_STATUS='PROBLEMS',PROGRESS_OUTCOME='VERIFIED'))
         assert len([e for e in c.events() if e['kind']=='implement'])==2
-        assert 'BLOCKED' not in c.run('2').stdout
+        assert 'BLOCKED' not in c.run('--resume').stdout
     finally:c.close()
 
 
-def test_nochange_restart_and_recovery():
+def test_nochange_extension_preserves_completion_without_stall_counter():
     import json
     c=Case()
     try:
-        c.enqueue('Fix the unresolved objective')
         ok(c.run('1',NO_CHANGE='1',PROGRESS_OUTCOME='NONE'))
-        before=c.events();ok(c.run('1'));assert before==c.events()
-        ok(c.run('2','--extend-budget',NO_CHANGE='1',PROGRESS_OUTCOME='NONE'))
-        r=c.run('3','--extend-budget',NO_CHANGE='1',PROGRESS_OUTCOME='NONE')
-        assert r.returncode==2,(r.stdout,r.stderr)
-        assert len([e for e in c.events() if e['kind']=='implement'])==2
+        before=c.events();ok(c.run('--resume'));assert c.events()==before
+        ok(c.run('--extend','2',NO_CHANGE='1',PROGRESS_OUTCOME='NONE'))
         ledger=json.loads((c.a/'work-state.json').read_text())['branches']['checkpoint/test']
-        assert ledger['block']['stalled_attempts']==2
-        c.enqueue('An unrelated note')
-        assert c.run('3',PROGRESS_OUTCOME='NONE').returncode==2
-        assert len([e for e in c.events() if e['kind']=='implement'])==2
-        c.enqueue('Use a different concrete approach: reproduce the gap from raw source facts first')
-        ok(c.run('3',PROGRESS_OUTCOME='NONE',REVIEW_RECOVERY='REVISED_APPROACH'))
+        assert ledger['block'] is None and len(ledger['allocated'])==1
         assert len([e for e in c.events() if e['kind']=='implement'])==3
-        assert all(row['state']=='active' for row in c.rows())
-        ledger=json.loads((c.a/'work-state.json').read_text())['branches']['checkpoint/test']
-        assert ledger['block'] is None and len(ledger['recoveries'])==1
     finally:c.close()
 
 
@@ -87,7 +67,7 @@ def test_wrong_identity_or_unbound_evidence_cannot_advance():
         c=Case()
         try:
             ok(c.run('1'))
-            r=c.run('2','--extend-budget',**change)
+            r=c.run('--extend','1',**change)
             assert r.returncode!=0,(r.stdout,r.stderr)
             assert len([e for e in c.events() if e['kind']=='implement'])==1
         finally:c.close()
@@ -110,14 +90,14 @@ def test_numbering_registry_ignores_reservations():
         plan=c.p/'draft.md'
         data={'objective':'actual-benchmark','finding_key':'classification','kind':'work','baseline':'gap is 8','success':'gap becomes 0','verification':'inspect measured gap'}
         for n in range(2):
-            plan.write_text('# Step '+parent+'.99 — proposed repair\nAUTOCYCLE_PLAN: '+json.dumps(data)+'\n')
+            plan.write_text('# Step '+parent+'.99 — proposed repair\nAUTOCYCLE_PLAN: '+json.dumps(data)+'\n## Completion\nThe measured gap is zero.\n')
             helper('prepare',str(plan))
-            assert plan.read_text().startswith('# Step '+parent+'.13 ')
+            assert plan.read_text().startswith('# Step 1.1 ')
             assert json.loads(helper('context'))['allocated_ids']==[parent+'.12']
         (c.repo/'IMPLEMENTATION.md').write_text(plan.read_text());c.git('add','.');c.git('commit','-qm','Plan: actual next work')
         sha=c.git('rev-parse','HEAD');helper('begin',sha)
         after=json.loads(helper('context'))
-        assert after['allocated_ids']==[parent+'.12',parent+'.13']
+        assert after['allocated_ids']==sorted(['1.1',parent+'.12'])
         ident=after['work']['id'];helper('begin',sha)
         assert json.loads(helper('context'))['work']['id']==ident
     finally:c.close()
@@ -126,9 +106,10 @@ def test_numbering_registry_ignores_reservations():
 def test_target_done_ends_budget():
     c=Case()
     try:
-        ok(c.run('20',REVIEW_STATUS='DONE'))
-        assert [e['kind'] for e in c.events()]==['review']
-        assert not (c.a/'resume-state').exists()
+        ok(c.run('1'))
+        ok(c.run('--extend','20',REVIEW_STATUS='DONE'))
+        assert [e['kind'] for e in c.events()]==['review','plan','implement','review']
+        assert 'STAGE=session_complete' in (c.a/'resume-state').read_text()
     finally:c.close()
 
 
@@ -142,6 +123,7 @@ def test_replayed_verified_review_is_not_a_new_attempt():
         r=subprocess.run(helper+['context'],cwd=c.repo,env=c.env,capture_output=True,text=True);ok(r)
         context=json.loads(r.stdout)
         report={'work_id':context['work']['id'],'attempt_id':context['attempt']['id'],'finding_key':'wording one','blocking':False,'blocking_reason':'NONE','outcome':'VERIFIED','reason':'Observed result improves the original criterion','evidence':[{'path':'RESULT.md','sha256':hashlib.sha256((c.repo/'RESULT.md').read_bytes()).hexdigest(),'observation':'Measured result'}]}
+        report['endpoint']={'status':'UNREACHED','session_sha256':hashlib.sha256((c.repo/'SESSION.md').read_bytes()).hexdigest(),'evidence':[]}
         answer=c.p/'review.answer'
         for token in ('first-review','replayed-review'):
             answer.write_text('REVIEW_STATUS: PASS\nREVIEW_TOKEN: '+token+'\nAUTOCYCLE_REVIEW: '+json.dumps(report)+'\n')
@@ -156,7 +138,7 @@ def test_unknown_recovery_survives_both_guards():
     try:
         r=c.run('2',PROGRESS_OUTCOME='UNKNOWN');assert r.returncode==2,(r.stdout,r.stderr)
         c.enqueue('Change approach: reproduce the defect using the original source data')
-        r=c.run('2',PROGRESS_OUTCOME='UNKNOWN',REVIEW_RECOVERY='REVISED_APPROACH');ok(r)
+        r=c.run('--resume',PROGRESS_OUTCOME='UNKNOWN',REVIEW_RECOVERY='REVISED_APPROACH');ok(r)
         assert len([e for e in c.events() if e['kind']=='implement'])==2
     finally:c.close()
 
@@ -165,9 +147,12 @@ def test_old_evidence_cannot_alternate_as_progress():
     c=Case()
     try:
         r=c.run('6',PROGRESS_OUTCOME='VERIFIED',ALTERNATE_RESULT='1')
-        assert r.returncode==2,(r.stdout,r.stderr)
-        assert 'REPEATED_NO_PROGRESS' in r.stdout
-        assert len([e for e in c.events() if e['kind']=='implement'])==4
+        ok(r)
+        import json
+        state=json.loads((c.a/'work-state.json').read_text())['branches']['checkpoint/test']
+        assert state['attempts'][-2]['outcome']=='NONE'
+        assert state['block'] is None
+        assert len([e for e in c.events() if e['kind']=='implement'])==6
     finally:c.close()
 
 
@@ -175,9 +160,8 @@ def test_planning_candidates_are_bounded():
     c=Case()
     try:
         r=c.run('4',PLAN_BLOCKED='1')
-        assert r.returncode==2,(r.stdout,r.stderr)
-        assert 'REPEATED_NO_PROGRESS' in r.stdout
-        assert len([e for e in c.events() if e['kind']=='plan'])==2
+        ok(r)
+        assert len([e for e in c.events() if e['kind']=='plan'])==4
         assert not [e for e in c.events() if e['kind']=='implement']
     finally:c.close()
 
@@ -191,7 +175,7 @@ def test_upgrade_at_legacy_review_boundary_keeps_pending_attempt():
         (c.a/'work-state.json').unlink()
         state=(c.a/'resume-state').read_text().replace('RUN_MAX=1','RUN_MAX=2').replace('RUN_CYCLE=1','RUN_CYCLE=2').replace('STAGE=checkpoint_done','STAGE=review_done')
         (c.a/'resume-state').write_text(state)
-        ok(c.run('2',PROGRESS_OUTCOME='NONE'))
+        ok(c.run('--resume',PROGRESS_OUTCOME='NONE'))
         ledger=json.loads((c.a/'work-state.json').read_text())['branches']['checkpoint/test']
         assert len(ledger['attempts'])==2,ledger
         assert ledger['attempts'][0]['outcome']=='NONE'

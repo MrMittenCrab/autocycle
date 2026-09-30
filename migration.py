@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Versioned conservative migration. Only run-state is changed; evidence is retained."""
-import os, shlex, sys, subprocess, hashlib, json
+import re, os, shlex, sys, subprocess, hashlib, json
 from pathlib import Path
 
 # Evidence collection must not refresh the caller's Git index.
 os.environ['GIT_OPTIONAL_LOCKS']='0'
 
-FIELDS={'STATE_VERSION','NETWORK_RETRIES','CANDIDATE_RESOLVED','RUN_MAX','RUN_CYCLE','STAGE','PLAN_SHA','IMPLEMENT_BASE_SHA','STATE_BRANCH','INPUT_CYCLE_ID','INPUT_ALLOW_NEW','NEXT_INPUT_ID','CHECKPOINT_UNSAFE','BOUNDARY_KIND'}
+FIELDS={'STATE_VERSION','NETWORK_RETRIES','CANDIDATE_RESOLVED','RUN_MAX','RUN_CYCLE','STAGE','PLAN_SHA','IMPLEMENT_BASE_SHA','STATE_BRANCH','INPUT_CYCLE_ID','INPUT_ALLOW_NEW','NEXT_INPUT_ID','CHECKPOINT_UNSAFE','BOUNDARY_KIND','SESSION_NEW','SESSION_NUMBER'}
 
 def migrate(path):
     raw=path.read_text(); state={}
@@ -22,7 +22,9 @@ def migrate(path):
     if not required<=state.keys():raise ValueError('missing saved state fields')
     cycle=int(state['RUN_CYCLE']);maximum=int(state['RUN_MAX'])
     if not 1<=cycle<=maximum:raise ValueError('invalid saved cycle budget')
-    stages={'start','reviewing','review_done','planning','plan_done','implementing','implement_done','implement_nochange','candidate_checkpoint','checkpoint_done','checkpoint_pending','boundary_input'}
+    stages={'start','reviewing','review_done','planning','plan_done','implementing','implement_done','implement_nochange','candidate_checkpoint','checkpoint_done','checkpoint_pending','boundary_input','session_complete','session_restarted'}
+    if not re.fullmatch(r'[1-9][0-9]*',state.get('SESSION_NUMBER','1')):raise ValueError('invalid Session number')
+    if state.get('SESSION_NEW','0') not in ('0','1'):raise ValueError('invalid fresh-session marker')
     if state.get('STATE_VERSION')=='2':
         if state['STAGE'] not in stages:raise ValueError('unknown saved stage')
         if state['STAGE']=='boundary_input' and not state.get('NEXT_INPUT_ID'):raise ValueError('missing next input identity')

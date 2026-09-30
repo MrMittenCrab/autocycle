@@ -19,8 +19,8 @@ def main():
     finally:
         c.close()
 
-    # Human input stays active after the implementation checkpoint.
-    # The following opening Review is what may verify COMPLETE and archive it.
+    # Steering is consumed by a published Plan.
+    # Implementation acceptance still waits for the following opening Review.
     c = Case()
     try:
         ident = c.enqueue("CURRENT_CONTRACT_INPUT")
@@ -31,25 +31,24 @@ def main():
         rows = c.rows()
         assert len(rows) == 1, rows
         assert rows[0]["id"] == ident, rows
-        assert rows[0]["state"] == "active", rows
+        assert rows[0]["state"] == "archived", rows
 
         state = (c.a / "resume-state").read_text()
         assert "STAGE=checkpoint_done" in state, state
 
         r = c.run(
-            "2",
-            "--extend-budget",
+            "--extend",
+            "1",
             REVIEW_STATUS="DONE",
-            INPUT_STATUS_OVERRIDE="COMPLETE",
         )
         ok(r)
 
         rows = c.rows()
         assert len(rows) == 1, rows
         assert rows[0]["state"] == "archived", rows
-        assert not (c.a / "resume-state").exists()
+        assert "STAGE=session_complete" in (c.a / "resume-state").read_text()
 
-        print("PASS instructed work archives only after following verified Review")
+        print("PASS input consumed at Plan; implementation acceptance waits for following Review")
     finally:
         c.close()
 

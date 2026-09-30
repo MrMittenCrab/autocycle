@@ -35,8 +35,8 @@ def verify_shell(shell):
         assert not (c.repo/'SHOULD_NOT_EXIST').exists() and not (c.repo/'ALSO_NOT').exists()
         assert c.git('status','--porcelain')==''
         assert c.git('rev-parse','HEAD')==c.git('rev-parse','origin/checkpoint/test')
-        assert c.rows()[0]['state']=='active'
-        ok(c.run('2','--extend-budget',REVIEW_STATUS='DONE',INPUT_STATUS_OVERRIDE='COMPLETE'))
+        assert c.rows()[0]['state']=='archived'
+        ok(c.run('--extend','1',REVIEW_STATUS='DONE'))
         assert c.rows()[0]['state']=='archived'
         print('PASS syntax, literal prompts, checkpoint and following Review: '+version,flush=True)
     finally:c.close()

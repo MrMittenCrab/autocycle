@@ -1,5 +1,6 @@
 #!/bin/bash
 set -euo pipefail
+if ! declare -F autocycle_git >/dev/null; then autocycle_git() { command git "$@"; }; fi
 
 ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || {
     echo "Not inside a Git repository."
@@ -20,7 +21,7 @@ if [[ -z "$BRANCH" ]]; then
     exit 1
 fi
 
-git fetch --prune origin >/dev/null
+autocycle_git fetch --prune origin >/dev/null
 
 # Never commit implementation work directly to main or a planning branch.
 # If we are not already on a checkpoint branch, create one.
@@ -40,7 +41,7 @@ fi
 #   checkpoint "my message"
 #
 # Default message:
-#   derive "Step 9K.1" from IMPLEMENTATION.md
+#   derive "Step 2.14" from IMPLEMENTATION.md
 if [[ $# -gt 0 ]]; then
     MESSAGE="$*"
 else
@@ -77,10 +78,24 @@ if ! OUTPUT=$(git commit -m "$MESSAGE" 2>&1); then
     exit 1
 fi
 
-if ! OUTPUT=$(git push -u origin "$BRANCH" 2>&1); then
-    echo "$OUTPUT"
-    exit 1
+# Reconcile owner-authored remote planning edits only after an owned local
+# checkpoint exists. Preserve both parent histories and require following Review.
+if [[ "${AUTOCYCLE_CHECKPOINT_GUARD:-0}" == 1 ]]; then
+    python3 "$HOME/.autocycle/remote_docs.py" merge || exit 1
 fi
+
+CHECKPOINT_SHA=$(git rev-parse HEAD)
+if OUTPUT=$(autocycle_git push origin "$CHECKPOINT_SHA:refs/heads/$BRANCH" 2>&1); then :; else
+    RC=$?
+    echo "$OUTPUT"
+    exit "$RC"
+fi
+
+[[ "$(git rev-parse HEAD)" == "$CHECKPOINT_SHA" && "$(git branch --show-current)" == "$BRANCH" ]] || {
+    echo "Checkpoint changed during publication; preserve for ownership reconciliation."
+    exit 1
+}
+git branch --set-upstream-to="origin/$BRANCH" "$BRANCH" >/dev/null
 
 echo "Branch: $BRANCH"
 echo "Commit: $(git log -1 --oneline)"
