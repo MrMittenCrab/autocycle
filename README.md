@@ -171,11 +171,24 @@ Native Office requires macOS, the enabled applications and their permissions. Te
 
 Physical files need not correspond one-to-one with components. Validators enforce structure, provenance and executability; provider contracts retain the separate semantic and execution authorities.
 
+[AGENTS.md](AGENTS.md) is the sole authority for selecting test scope. Development verification uses focused tests, broadening to affected regressions only for a concrete changed dependency or invariant. Ordinary executable changes do not automatically require full certification; state why focused/affected verification is insufficient before running a broad/full suite.
+
 ```sh
-python3 run_tests.py       # isolated deterministic Git/provider/Office fixtures
-python3 install.py --install
+python3 run_tests.py test_install.py                    # focused verification
+python3 run_tests.py test_install.py test_run_tests.py  # explicitly selected regressions
+python3 run_tests.py test_response_parser.js            # only the selected JS test
+python3 run_tests.py                                   # full deterministic certification
 ```
 
-The installer checks that controllers are stopped, compiles the native helper, runs the deterministic suite, verifies source stability and installs atomically with backups. `autocycle`, `sync` and `checkpoint` install to `~/bin`; other runtime files and the compiled `autocycle-office-capture` helper install to `~/.autocycle`. Installation does not start a project.
+Scoped mode accepts repository-root Python test names/paths and `test_response_parser.js`; it rejects unknown/unsafe targets and adds no other tests or shell checks. No arguments preserves all Python regression scripts, shell syntax checks and the JavaScript parser test.
+
+```sh
+python3 install.py --install           # certified install: full-suite success required
+python3 install.py --install-verified  # caller has already verified source under AGENTS.md
+```
+
+`--install` preserves the existing full deterministic suite gate before runtime replacement. `--install-verified` does not run tests or provide certification: completing the verification required by AGENTS.md is a caller precondition. These options are mutually exclusive. For compatibility, `python3 install.py` without an installation option still runs full certification without installing.
+
+Both installation paths refuse active controllers, compile the native helper, check source stability, prepare all backups and temporary files before replacement, and atomically replace each file with the controller last. `autocycle`, `sync` and `checkpoint` install to `~/bin`; other runtime files and the compiled `autocycle-office-capture` helper install to `~/.autocycle`. Installation does not start a project.
 
 Requires Bash 3.2 or newer, Python 3.11 or newer, Node.js, Git, authenticated Codex and Cursor providers; native capture builds with Apple's Swift tools. Local repair reports, install manifests, caches and diagnostic logs are verification artifacts, not canonical source. Supported installation uses `install.py`, not historical patch installers.

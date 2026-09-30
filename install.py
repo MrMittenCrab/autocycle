@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify this source, then explicitly install it with backups; never run a project."""
+"""Certify source by default; explicitly install with backups, never launch a project."""
 import argparse
 import datetime
 import hashlib
@@ -36,7 +36,7 @@ def build_native(root, output):
                     str(root/'office_capture.swift'), '-o', str(output)], check=True)
 
 
-def install(root,home):
+def install(root,home,*,certify=True):
     assert_stopped()
     with tempfile.TemporaryDirectory(prefix='autocycle-build-') as directory:
         helper = Path(directory)/'autocycle-office-capture'
@@ -44,12 +44,14 @@ def install(root,home):
         build_native(root, helper)
         if snapshot(root) != before:
             raise RuntimeError('Source changed during compilation; rerun installation.')
-        install_verified(root, home, helper)
+        install_verified(root, home, helper, certify=certify, source_snapshot=before)
 
 
-def install_verified(root,home,helper):
-    before=snapshot(root)
-    subprocess.run([sys.executable,str(root/'run_tests.py')],cwd=root,check=True)
+def install_verified(root,home,helper,*,certify=True,source_snapshot=None):
+    # Keep the existing internal entry point certified by default as well.
+    before=snapshot(root) if source_snapshot is None else source_snapshot
+    if certify:
+        subprocess.run([sys.executable,str(root/'run_tests.py')],cwd=root,check=True)
     if snapshot(root)!=before:raise RuntimeError('Source changed during verification; rerun installation.')
     assert_stopped()
     backup=home/'.autocycle/backups'/('session-'+datetime.datetime.now().strftime('%Y%m%d-%H%M%S-%f'))
@@ -62,22 +64,25 @@ def install_verified(root,home,helper):
             if dest.exists():shutil.copy2(dest,backup/name)
             fd,temp=tempfile.mkstemp(prefix='.'+name+'.',dir=dest.parent)
             os.close(fd);temp=Path(temp)
+            prepared.append((temp,dest))
             shutil.copyfile(helper if name == 'autocycle-office-capture' else root/name,temp)
             temp.chmod(0o755 if name in ('autocycle','stage','sync','checkpoint','autocycle-office-capture') else 0o600)
             with temp.open('rb') as f:os.fsync(f.fileno())
-            prepared.append((temp,dest))
+        if snapshot(root)!=before:raise RuntimeError('Source changed during preparation; rerun installation.')
         assert_stopped()
         for temp,dest in sorted(prepared,key=lambda pair:pair[1].name=='autocycle'):
             os.replace(temp,dest)
-        print('Installed verified AutoCycle. Backup:',backup)
+        print('Installed '+('certified' if certify else 'caller-verified (not certified)')+' AutoCycle. Backup:',backup)
     finally:
         for temp,_ in prepared:temp.unlink(missing_ok=True)
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--install',action='store_true',help='install after the full test suite passes')
+    modes=parser.add_mutually_exclusive_group()
+    modes.add_argument('--install',action='store_true',help='certified installation: require full deterministic suite success before replacement')
+    modes.add_argument('--install-verified',action='store_true',help='install already-verified source without certification; caller must first complete verification required by AGENTS.md')
     args=parser.parse_args();root=Path(__file__).resolve().parent
-    if args.install:install(root,Path.home())
+    if args.install or args.install_verified:install(root,Path.home(),certify=not args.install_verified)
     else:subprocess.run([sys.executable,str(root/'run_tests.py')],cwd=root,check=True)
 
 if __name__=='__main__':main()
