@@ -1,5 +1,9 @@
 #!/bin/bash
 set -euo pipefail
+if ! declare -F autocycle_git >/dev/null; then autocycle_git() { command git "$@"; }; fi
+ADJUDICATOR="$HOME/.autocycle/adjudication.py"
+adjudication() { python3 "$ADJUDICATOR" "$@"; }
+progress() { python3 "$(dirname "$ADJUDICATOR")/progress.py" "$@"; }
 
 usage() {
     echo "Usage:"
@@ -13,92 +17,63 @@ usage() {
 
 LIVE_TIMER_PID=""
 LIVE_TIMER_LABEL=""
-LIVE_TIMER_START=0
 
-# AUTOCYCLE_TIMER_CLEANUP_V1
 live_stop_timer() {
     if [[ -n "${LIVE_TIMER_PID:-}" ]]; then
+        local TRY
+        for ((TRY=0; TRY<50; TRY++)); do
+            kill -0 "$LIVE_TIMER_PID" 2>/dev/null || break
+            [[ ! -f "${AUTOCYCLE_DISPLAY_STATE:-}.renderer-$LIVE_TIMER_PID" ]] || break
+            sleep 0.02
+        done
         kill "$LIVE_TIMER_PID" >/dev/null 2>&1 || true
         wait "$LIVE_TIMER_PID" >/dev/null 2>&1 || true
         LIVE_TIMER_PID=""
     fi
-}
+} 2>/dev/null
 
 trap live_stop_timer EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'exit 129' HUP
 
-format_elapsed() {
-    local NOW="$1"
-    local START="$2"
-    local SECONDS_ELAPSED=$((NOW - START))
-
-    printf "%02d:%02d" \
-        "$((SECONDS_ELAPSED / 60))" \
-        "$((SECONDS_ELAPSED % 60))"
-}
-
 live_start() {
     local LABEL="$1"
-    local TIMER_OWNER_PID="$$"
-
     live_stop_timer
-
     LIVE_TIMER_LABEL="$LABEL"
-    LIVE_TIMER_START=$(date +%s)
-
-    (
-        while kill -0 "$TIMER_OWNER_PID" 2>/dev/null; do
-            if [[ -t 1 ]]; then
-                NOW=$(date +%s)
-                TIME=$(format_elapsed "$NOW" "$LIVE_TIMER_START")
-
-                printf "\r%-12s%s" "$LABEL" "$TIME"
-            fi
-
-            sleep 1
-        done
-    ) &
-
-    LIVE_TIMER_PID=$!
+    if [[ -z "${AUTOCYCLE_DISPLAY_STATE:-}" ]]; then
+        AUTOCYCLE_DISPLAY_STATE=$(mktemp "$LOG_DIR/stage-display.XXXXXX")
+        export AUTOCYCLE_DISPLAY_STATE
+    fi
+    node "$(dirname "$ADJUDICATOR")/stage_display.js" "$AUTOCYCLE_DISPLAY_STATE" "$LABEL" clock >/dev/null
+    if [[ -t 1 ]]; then
+        node "$(dirname "$ADJUDICATOR")/stage_display.js" "$AUTOCYCLE_DISPLAY_STATE" "$LABEL" live &
+        LIVE_TIMER_PID=$!
+    fi
 }
 
 live_finish() {
     local SYMBOL="$1"
     local SUMMARY="${2:-}"
-
-    if [[ -n "${LIVE_TIMER_PID:-}" ]]; then
-        kill "$LIVE_TIMER_PID" >/dev/null 2>&1 || true
-        wait "$LIVE_TIMER_PID" >/dev/null 2>&1 || true
-    fi
-
-    local NOW
-    local TIME
-
-    NOW=$(date +%s)
-    TIME=$(format_elapsed "$NOW" "$LIVE_TIMER_START")
-
-    if [[ -t 1 ]]; then
-        printf "\r\033[2K"
-    fi
-
-    printf "%-12s%s %s\n" \
-        "$LIVE_TIMER_LABEL" \
-        "$SYMBOL" \
-        "$TIME"
-
-    if [[ -n "$SUMMARY" ]]; then
-        echo "    $SUMMARY"
-    fi
-
-    LIVE_TIMER_PID=""
+    live_stop_timer
+    local ACTION=finish
+    [[ "${AUTOCYCLE_CONTROLLER_REVIEW:-}" != 1 ]] || ACTION=outcome
+    node "$(dirname "$ADJUDICATOR")/stage_display.js" "$AUTOCYCLE_DISPLAY_STATE" "$LIVE_TIMER_LABEL" "$ACTION" "$SYMBOL" "$SUMMARY"
     LIVE_TIMER_LABEL=""
-    LIVE_TIMER_START=0
 }
 
 live_done() {
     live_finish "✓" "${1:-}"
+}
+
+provider_failure() {
+    if [[ "${AUTOCYCLE_CONTROLLER_REVIEW:-}" == 1 ]] &&
+       node "$(dirname "$ADJUDICATOR")/implementation_response.js" --transport "$2"; then
+        live_stop_timer
+        printf '%s\n' "$1" > "$AUTOCYCLE_DISPLAY_STATE.failure"
+        exit 74
+    fi
+    fail "$1"
 }
 
 live_fail() {
@@ -106,6 +81,10 @@ live_fail() {
 }
 
 fail() {
+    if [[ "${LIVE_TIMER_LABEL:-}" == Review || "${LIVE_TIMER_LABEL:-}" == Plan ]]; then
+        live_finish "✗" "$1"
+        exit 1
+    fi
     if [[ -n "${LIVE_TIMER_PID:-}" ]]; then
         live_fail
     fi
@@ -151,6 +130,10 @@ esac
 # Repository
 # ============================================================
 
+if [[ "$MODE" == "--run" ]]; then
+    exec "$HOME/bin/autocycle" "$MAX_CYCLES"
+fi
+
 ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || {
     fail "not inside a Git repository."
 }
@@ -190,10 +173,7 @@ if [[ "$needs_cursor" -eq 1 ]]; then
     command -v node >/dev/null 2>&1 || fail "Node.js not found."
 fi
 
-if [[ "$MODE" == "--run" ]]; then
-    command -v sync >/dev/null 2>&1 || fail "sync not found."
-    command -v checkpoint >/dev/null 2>&1 || fail "checkpoint not found."
-fi
+
 
 # ============================================================
 # State
@@ -205,6 +185,13 @@ SHORT_SHA=""
 REMOTE_SHA=""
 
 refresh_state() {
+    if [[ "$MODE" == "--review-only" && "${AUTOCYCLE_LOCAL_REVIEW:-0}" == 1 ]]; then
+        BRANCH=$(git branch --show-current)
+        [[ -n "$BRANCH" ]] || fail "detached HEAD; local evidence preserved."
+        SHA=$(git rev-parse HEAD)
+        SHORT_SHA=$(git rev-parse --short HEAD)
+        return
+    fi
     BRANCH=$(git branch --show-current)
 
     [[ -n "$BRANCH" ]] || fail "detached HEAD."
@@ -220,7 +207,7 @@ refresh_state() {
         fi
     fi
 
-    git fetch --prune origin >/dev/null 2>&1 \
+    autocycle_git fetch --prune origin >/dev/null 2>&1 \
         || fail "could not fetch origin."
 
     SHA=$(git rev-parse HEAD)
@@ -252,32 +239,61 @@ mkdir -p "$LOG_DIR"
 CACHE_FILE="$LOG_DIR/current-review"
 QUEUE_HELPER="$HOME/.autocycle/instructions.py"
 HUMAN_INPUT_PROMPT=""
-if [[ -n "${AUTOCYCLE_INPUT_KEY:-}" ]]; then
-    [[ "$AUTOCYCLE_INPUT_KEY" == "${AUTOCYCLE_INPUT_BATCH:-}" ]] || fail "instruction batch identity mismatch."
-    case "$MODE" in
-        --review-only|--plan-only)
-            HUMAN_INPUT_PROMPT=$(python3 "$QUEUE_HELPER" --dir "$LOG_DIR" prompt "$AUTOCYCLE_INPUT_KEY") \
-                || fail "could not load frozen human input."
-            ;;
-    esac
+INPUT_CONTEXT=$(adjudication context "${AUTOCYCLE_INPUT_BATCH:-}") || fail "could not verify frozen input context."
+INPUT_COUNT=$(python3 -c 'import json,sys;print(json.loads(sys.argv[1])["count"])' "$INPUT_CONTEXT")
+EXPECTED_INPUT_STATUS=NONE
+VERIFIED_INPUT_KEY=""
+if (( INPUT_COUNT > 0 )); then
+    VERIFIED_INPUT_KEY="${AUTOCYCLE_INPUT_BATCH}"
+    EXPECTED_INPUT_STATUS="COMPLETE | PENDING"
 fi
+[[ "${AUTOCYCLE_INPUT_KEY:-}" == "$VERIFIED_INPUT_KEY" ]] || fail "instruction key disagrees with verified frozen context."
+case "$MODE" in
+    --review-only|--plan-only)
+        if [[ -n "$VERIFIED_INPUT_KEY" ]]; then
+            HUMAN_INPUT_PROMPT=$(python3 "$QUEUE_HELPER" --dir "$LOG_DIR" prompt "$VERIFIED_INPUT_KEY") \
+                || fail "could not load frozen human input."
+        fi
+        ;;
+esac
+INPUT_CONTEXT_PROMPT="Verified frozen input context for this invocation:
+Requests in immutable cycle snapshot: $INPUT_COUNT
+Allowed INPUT_STATUS: $EXPECTED_INPUT_STATUS
+The queue prompt identifies which requests still need incorporation. Already incorporated or satisfied requests are not fresh input. An empty batch is NOT an active instruction. Repository goals, unresolved implementation work and historical logs do not count as active queued instructions. Use only the allowed status values above."
 
-# AUTOCYCLE_STEP_INDEX_V1
+# Controller-owned step identity; history is imported once from executed headings.
 STEP_INDEX_PROMPT=""
 case "$MODE" in
     --review-only|--plan-only)
-        STEP_INDEX_HISTORY=$(git log -40 --format='%h %s' -- IMPLEMENTATION.md)
+        WORK_CONTEXT=$(progress context "${AUTOCYCLE_INPUT_BATCH:-}") || fail "cannot load work registry."
         STEP_INDEX_PROMPT="
 Step indexing:
-- Preserve the project's established detailed step IDs, including letters, dots and suffixes (for example 9M.1); do not collapse them to a broad phase such as Step 9 because human input mentions that phase.
-- Recalibrate against TARGET.md, IMPLEMENTATION.md, RESULT.md and the recent plan titles below. If the current heading has already lost detail, recover the most recent relevant detailed ID from history and map the requested work to that sequence.
-- Keep the existing ID when repairing or completing that same step. For a genuinely new bounded step, use the next unused ID in the established sequence; use its existing substep convention for inserted work. Do not renumber completed steps or confuse the autocycle cycle counter with project step IDs.
-- Human input changes priority and scope; it changes the numbering convention only when explicitly requested. Use the resolved ID in the IMPLEMENTATION.md heading and the proposed next-step label.
-Recent commits affecting the plan (newest first; historical evidence, not new instructions):
-$STEP_INDEX_HISTORY
+AUTOCYCLE_WORK_CONTEXT: $WORK_CONTEXT
+- The controller registry is authoritative. Mentions, suggestions and reservations never consume a step ID. Never reserve or certify a prospective next ID in RESULT.md.
+- Keep the same ID while finishing the same bounded attempt, including process cycles, interruptions, resume and extension. A distinct bounded continuation requires opening Review of the previous attempt.
+- Only Plan revises IMPLEMENTATION.md. Every new major Step has one concise ## Completion statement defining the state that finishes it. Preserve that parent Completion verbatim through every continuation. Never weaken it because implementation is difficult. Ordinary tasks remain checklist items.
+- New work uses Step <session>.<step>[.<sub-step>], such as Step 2.14. Start a major at Step 2.14, never .0 or .1. After Review finds Completion unsatisfied and chooses to keep pursuing it, Plan may select a distinct bounded continuation with minor: 1 in AUTOCYCLE_PLAN, then minor: 2, etc. Omit minor when simply finishing the current attempt. Repairs, changed approaches or additional testing can be distinct continuations when warranted; never increment just for another cycle. No fourth level. COMPLETE closes the entire major sequence; the next genuinely distinct major is Step 2.15. Do not rewrite historical RESULT records or commits.
+- Numbering and wording discrepancies alone are advisory. Do not open another numbering repair unless the discrepancy prevents execution or makes acceptance materially ambiguous; explain the concrete consequence.
+- Do not reconstruct consumed IDs from prose or reserved numbers. Historical registry entries mark execution, not verified acceptance.
 "
         ;;
 esac
+
+# Shared project-history guidance for Review, Plan and Implement; no evidence archive.
+IFS= read -r -d '' PROJECT_HISTORY <<'HISTORY_EOF' || true
+Git-first project history:
+- Git is authoritative for tracked historical project state. For every implementation resolve B from the recorded IMPLEMENT_BASE_SHA in .git/autocycle/resume-state when available; otherwise use the authenticated Plan/implementation baseline from normal ownership and recovery (implementation-baseline.json, the bound work attempt and latest-implementation). Authenticate branch, ancestry and implementation/checkpoint binding through those normal mechanisms. Do not select a migration-specific baseline or invent recovery. If no authenticated baseline can be established, fail closed.
+- For migration-related Review evaluate in order: (1) authenticated B, (2) historical Git blobs at B, (3) current canonical destinations/files, (4) provenance/path continuity, (5) current build/check behavior, (6) relevant regressions and native verification, (7) other evidence explicitly required by active user instructions, SESSION.md or current IMPLEMENTATION.md. Use git show B:path or git cat-file to inspect/materialize prior content directly; do not substitute a transient working-tree observation for B.
+- Tracked move: identify the intended canonical destination from the implementation diff/current architecture, compare its bytes with the old Git blob at B (exact identity, SHA-256 and byte size where useful), and verify normal provenance/path mapping. Matching content with provenance continuity is a preserved relocation. Allow the old path to disappear; no duplicate legacy copy, receipt, backup or human approval is required for migration evidence.
+- Tracked deletion without an identical surviving destination: Git retains historical bytes. Historical existence needs no receipt or extra copy. Judge removal against current requirements: obsolete/generated/redundant material may be removed when architecture, build/check and regressions support removal; required source/data/functionality may not be lost. An absent old path alone is not a blocker.
+- Tracked replacement/modification: compare the Git version at B with the current filesystem only as current acceptance requires. Legitimately changed generated output does not require byte identity; use semantic, build/check, regression and provenance verification. Byte mismatch blocks a claimed identical relocation, not every intentional replacement.
+- Non-Git generated, temporary, cache or redundant state has no historical preservation requirement by default. Current correctness and active instructions govern removal; do not create receipts, backups or approval prompts solely for removal.
+- Non-Git irreplaceable source evidence: before the old copy disappears, establish the intended canonical destination and verify content continuity while both copies are available, preserving normal provenance. Without a surviving destination, block the destructive operation. No migration backup or human approval is required.
+- Explicit exact-state requirements in active user instructions, SESSION.md or current IMPLEMENTATION.md remain binding, including exact non-Git artifacts. Do not create automatic waivers, backups or receipts for this exceptional case. Missing canonical source/data, relocation content mismatch, broken provenance, actual loss of required source evidence, failed build/check/regression or native verification, and unmet active requirements remain defects.
+- Fresh Review must re-evaluate an old migration blocker from B and the active acceptance contract. Discard a historical exact-artifact requirement when the requested artifact is not represented by B, is not reconstructible from Git, and is not explicitly required by active user instructions, SESSION.md or current IMPLEMENTATION.md. This is a stale requirement based on the wrong historical reference point, not evidence satisfying acceptance. Old Review observations and delivered instructions do not create permanent acceptance requirements or get replayed as new authority. Do not require an obsolete path, legacy tree or non-baseline transient artifact merely because a previous Review referenced it. Never claim later verification proves an earlier gate ran.
+- Preserve normal baseline, ownership attribution, provider retry, human adoption, interruption, candidate validation, protected-document, unrelated-dirty-work and Review-cache safeguards. Git preserves project history; .git/autocycle preserves controller/recovery evidence Git does not provide.
+HISTORY_EOF
+export AUTOCYCLE_PROJECT_HISTORY="$PROJECT_HISTORY"
 
 timestamp() {
     date +%Y%m%d-%H%M%S
@@ -310,6 +326,10 @@ CHECKPOINT_SHORT=""
 
 load_review() {
     local FILE="$1"
+    local FIELD
+    for FIELD in REVIEW_STATUS REVIEW NEXT_STEP REVIEWED_SHA; do
+        [[ "$(grep -c "^$FIELD: " "$FILE" || true)" == 1 ]] || return 1
+    done
 
     STATUS_LINE=$(grep '^REVIEW_STATUS:' "$FILE" | tail -n 1 || true)
     REVIEW_LINE=$(grep '^REVIEW:' "$FILE" | tail -n 1 || true)
@@ -334,42 +354,74 @@ load_review() {
             ;;
     esac
 
-    [[ "$REVIEWED_SHA" == "$SHA" ]] || return 1
+    [[ -n "$REVIEW_TEXT" && -n "$NEXT_STEP" && "$REVIEWED_SHA" == "$SHA" ]] || return 1
 
     return 0
 }
 
 write_review_cache() {
-    cat > "$CACHE_FILE" <<CACHE_EOF
+    cat > "$CACHE_FILE.tmp.$$" <<CACHE_EOF
+REVIEW_POLICY: $(adjudication policy)
+REVIEW_TOKEN: $REVIEW_TOKEN
+$PROGRESS_RECORD
+REVIEW_IDENTITY: $REVIEW_IDENTITY
 CACHE_BRANCH: $BRANCH
-INPUT_BATCH: ${AUTOCYCLE_INPUT_KEY:-}
+INPUT_BATCH: ${AUTOCYCLE_INPUT_BATCH:-}
 $STATUS_LINE
 $REVIEW_LINE
 $NEXT_LINE
 $SHA_LINE
+HUMAN_ACTION: $HUMAN_ACTION
+BLOCKER_KEY: $BLOCKER_KEY
+INPUT_STATUS: $INPUT_STATUS
 CACHE_EOF
+    mv "$CACHE_FILE.tmp.$$" "$CACHE_FILE"
 }
 
 cached_review_is_valid() {
-    [[ -f "$CACHE_FILE" ]] || return 1
+    adjudication valid "$CACHE_FILE" "${AUTOCYCLE_INPUT_BATCH:-}" || return 1
+    load_review "$CACHE_FILE"
 
-    local CACHE_BRANCH
-    CACHE_BRANCH=$(grep '^CACHE_BRANCH:' "$CACHE_FILE" | tail -n 1 || true)
-    CACHE_BRANCH=${CACHE_BRANCH#CACHE_BRANCH: }
-
-    [[ "$CACHE_BRANCH" == "$BRANCH" ]] || return 1
-    [[ "$(sed -n 's/^INPUT_BATCH: //p' "$CACHE_FILE" | tail -n 1)" == "${AUTOCYCLE_INPUT_KEY:-}" ]] || return 1
-    load_review "$CACHE_FILE" || return 1
-    [[ "$REVIEWED_SHA" == "$SHA" ]] || return 1
-    [[ "$(git rev-parse "origin/$BRANCH")" == "$SHA" ]] || return 1
-    [[ -z "$(git status --porcelain)" ]] || return 1
-
-    return 0
 }
 
 # ============================================================
 # Review
 # ============================================================
+
+# Validate provider output in a subshell: rejected fields never reach the cache.
+validate_review_response() (
+    fail() { printf '%s\n' "$1"; exit 1; }
+    load_review "$ANSWER" || fail "invalid Codex review: require unique REVIEW_STATUS, REVIEW, NEXT_STEP and REVIEWED_SHA matching HEAD."
+    for FIELD in HUMAN_ACTION BLOCKER_KEY; do
+        [[ "$(grep -c "^$FIELD: " "$ANSWER" || true)" == 1 ]] || fail "ambiguous adjudication field $FIELD."
+    done
+    INPUT_STATUS=$(sed -n 's/^INPUT_STATUS: //p' "$ANSWER")
+    if ! python3 - "$INPUT_CONTEXT" "$INPUT_STATUS" "$REVIEW_LOG.diagnostic.json" <<'STATUS_PY'
+import json,sys
+context=json.loads(sys.argv[1]);received=sys.argv[2]
+if received not in context['allowed']:
+    # Never print arbitrary provider output or instruction text.
+    safe=received if received in ('COMPLETE','PENDING','NONE') else '<malformed>'
+    data=dict(context,received=safe)
+    with open(sys.argv[3],'w') as f:json.dump(data,f,sort_keys=True)
+    print('Instruction status: expected '+ ' | '.join(context['allowed'])+'; received '+safe+'. Diagnostic: '+sys.argv[3])
+    sys.exit(1)
+STATUS_PY
+    then
+        fail "invalid instruction completion status; review not accepted."
+    fi
+    [[ "$STATUS" != DONE || "$INPUT_STATUS" != PENDING ]] || fail "DONE cannot leave active instructions pending. Log: $REVIEW_LOG"
+    HUMAN_ACTION=$(sed -n 's/^HUMAN_ACTION: //p' "$ANSWER")
+    BLOCKER_KEY=$(sed -n 's/^BLOCKER_KEY: //p' "$ANSWER")
+    [[ -n "$HUMAN_ACTION" && -n "$BLOCKER_KEY" ]] || fail "invalid adjudication fields; rerun review."
+    if [[ "$STATUS" == BLOCKED ]]; then
+        [[ "$HUMAN_ACTION" != NONE && "$NEXT_STEP" != NONE ]] || fail "BLOCKED lacks concrete human action."
+    fi
+    local SUMMARY
+    SUMMARY=$(progress validate-review "$ANSWER" 2>&1) \
+        || fail "invalid progress evidence; ${SUMMARY#Progress: }"
+    printf '%s' "$SUMMARY"
+)
 
 run_review() {
     live_start "Review"
@@ -379,20 +431,80 @@ run_review() {
     local EXIT_CODE
 
     T=$(timestamp)
-    REVIEW_LOG="$LOG_DIR/review-$T.log"
+    REVIEW_LOG="$LOG_DIR/review-$T-$$.log"
+    local ANSWER="$REVIEW_LOG.answer"
+    REVIEW_IDENTITY=$(adjudication identity "${AUTOCYCLE_INPUT_BATCH:-}") || fail "cannot bind review evidence."
+    [[ "$(adjudication context "${AUTOCYCLE_INPUT_BATCH:-}")" == "$INPUT_CONTEXT" ]] || fail "frozen input changed while constructing prompt."
+    local CANDIDATE_PROMPT=""
+    if [[ -f "$LOG_DIR/candidate.json" ]]; then
+        CANDIDATE_PROMPT="Adjudicate the preserved candidate in $LOG_DIR/candidate.json using actual checkpointed evidence. Check branch, revision and input batch; preserve candidate history and valid partial work. Its presence or Cursor's claim does not establish a current blocker.
+Reason in this order:
+A. Does the candidate actually prevent the current major-Step Completion? If no, defer it, use blocking=false and BLOCKER_KEY: NONE, and do not create repair work merely because a candidate exists.
+B. If it prevents Completion, is that same Completion still a sensible and achievable intermediate goal toward the Session Endpoint? If yes, keep Completion unchanged. Return PROBLEMS for a directly necessary bounded technical repair; Plan may choose a distinct continuation at Step x.y.1, then Step x.y.2, etc. Simply finishing the same attempt retains its identifier; never nest deeper.
+C. Has the blocker shown that this major Step is the wrong route to the Session Endpoint? If yes, use blocking=false because a different route remains available, explain the concrete relevance reason using the existing reviewed defer_work mechanism, return to SESSION.md Endpoint and Priority, and let Plan select a genuinely different major with a new Completion. Do not weaken Completion because implementation is difficult.
+D. Native Excel cached-value verification has an installed excel_verification.py copy/recalculate/verify helper. If it has not been tried for the current workbook, route to bounded implementation to run it with the existing project verifier; unattempted automation is not unavailable human access. If it failed, inspect its evidence and preserve the specific failure Action (permissions, dialog/timeout, open/calculate/save/close or verifier failure). Only structured evidence of a concrete external dependency permits BLOCKED; otherwise return PROBLEMS for bounded diagnosis or repair. Preserve checkpointed state, leave the Session incomplete, and claim neither Step Completion nor Endpoint completion.
+Use stagnation as advisory context to seriously reconsider repeated unproductive approaches or the major Step's relevance. There is no threshold or ceiling and no automatic response to any value. A candidate alone never counts as a no-progress judgment. Neither deferral nor a proposed repair bypasses ownership, checkpoint, publication or recovery safeguards. Only Review decides blocker significance, progress, closure and redirection; Plan follows that decision."
+    fi
 
-    PROMPT=$(cat <<PROMPT_EOF
-Review HEAD $SHA on branch $BRANCH against the current IMPLEMENTATION.md and TARGET.md if present.
+    local EXCEL_EVIDENCE="${AUTOCYCLE_EXCEL_RECOVERY:-}"
+    if [[ -z "$EXCEL_EVIDENCE" ]]; then
+        EXCEL_EVIDENCE=$(python3 "$(dirname "$ADJUDICATOR")/excel_verification.py" --review-evidence "$SHA")
+    fi
+
+    local OFFICE_EVIDENCE
+    OFFICE_EVIDENCE=$(python3 "$(dirname "$ADJUDICATOR")/native_office.py" review-evidence) || fail "cannot read native Office evidence."
+
+    # Bash 3.2 misparses quotes in heredocs nested inside $(...). Read directly;
+    # EOF is the expected nonzero read status because no NUL delimiter is sent.
+    IFS= read -r -d '' PROMPT <<PROMPT_EOF || true
+Review HEAD $SHA on branch $BRANCH against the current IMPLEMENTATION.md, SESSION.md and TARGET.md if present.
+Fresh session deriving a new Endpoint: ${AUTOCYCLE_NEW_SESSION:-0}.
+Native Excel resume verification evidence: $EXCEL_EVIDENCE.
+$OFFICE_EVIDENCE
+Inspect the compact Office index first and verify its SHA-256. It is a locator, not evidence acceptance. Open only the referenced receipts/results/screenshots/rendered evidence needed for the current Completion. Receipt status is evidence, never automatic acceptance; actual visual/readability evidence remains authoritative for visual claims. Check artifact_retention when present: only retained artifacts are live; pruning/pruned/unresolved artifacts cannot prove visual claims.
+If relevant evidence is not indexed, search .git/autocycle/office/receipts and .git/autocycle/office/evidence narrowly, read-only, and verify request/source/revision/recovery bindings before use. Weakly bound legacy records remain on disk for this inspection. Never select evidence by file age, directory order, or a generic latest rule. Do not bulk-read the entire Office evidence store.
+For opted-in projects, all new native Office interaction uses .git/autocycle/office/{excel,word}-{verify,view} slots. Never open immutable snapshots directly in Office. Historical randomized copies are not slot-lifecycle blockers; do not close or modify them. Access failures and capture failures (including black images) are infrastructure failures, not presentation/product defects; they require PROBLEMS for diagnosis unless structured evidence establishes an external dependency. Inspect validated controller receipts, retain completed implementation and immutable saved-state evidence, and do not regenerate product files merely to retry capture. Actual visible clipping/readability defects alone are presentation failures. Use authenticated current observation references and exact source/applicability bindings; historical recovery associations are provenance only. Never choose replacement evidence by age, directory order, or a generic latest-evidence rule. Historical rejected observations cannot satisfy replacement requirements. Review alone decides acceptance. Before declaring evidence materially unresolved, exhaust applicable existing evidence and supported read-only Observer inspection of checkpointed artifacts. To observe, return only OBSERVER_REQUEST: {"requests":[{"app":"word","source":"checkpointed.docx","source_sha256":"actual SHA-256"}]} (Excel additionally needs worksheet). Supported capture/navigation operations inspect fixed copies without mutating the target project. Controller authenticates the request and returns observations to this same Review, same cycle and stage timer. Do not emit a final Review verdict alongside an Observer request. Planner cannot call Observer.
+If present, inspect that new evidence and its saved snapshot (the stable copy may be updated by a later attempt) when adjudicating the preserved Excel blocker. Do not replay completed work. Only Review can accept recovery or Completion; retain any other unresolved requirements.
 
 $HUMAN_INPUT_PROMPT
+$INPUT_CONTEXT_PROMPT
 $STEP_INDEX_PROMPT
+$PROJECT_HISTORY
+
+Persistence and planning discipline:
+- TARGET.md is the project destination. SESSION.md holds this session Endpoint and Priority. IMPLEMENTATION.md holds only current bounded work.
+- During Review classify each undelivered instruction by actual effect: target, endpoint, priority, implementation; a request can affect several levels. Classify every ID still needing incorporation, using implementation for concrete execution guidance; never reuse delivered IDs. For independently satisfied inputs (INPUT_STATUS COMPLETE), use an empty direction object and do not request document changes. Record direction as a JSON object mapping those levels to exact instruction IDs in AUTOCYCLE_REVIEW. Plan follows those bindings through the existing instruction mechanism.
+- If an explicit Target, Endpoint or Priority amendment makes unresolved work irrelevant, Review may include defer_work: {"work_id":"current work.id","instruction_ids":["authorizing direction instruction IDs"],"reason":"why the amendment defers this work relative to the Endpoint"}. Preserve its original plan and evidence in the ledger; deferral is not completion and cannot clear a missing-evidence block. Review may also use defer_work with empty instruction_ids after outcome NONE or VERIFIED when the evidence shows the intermediate goal is no longer a sensible route to the Session Endpoint; give the concrete relevance reason. Difficulty alone does not justify replacement. Plan may start a different major only after closure or this reviewed deferral; do not carry deferred ancestry into IMPLEMENTATION.md.
+- Target changes never invent a new Endpoint. Reconcile the existing Session and report an actual conflict for a human decision. Priority-only changes leave TARGET unchanged; technique-only changes leave TARGET and SESSION unchanged.
+- Endpoint and Priority persist until explicitly changed; record their changes in SESSION.md, never only in queue receipts. On an ordinary start or explicit --restart, derive a new Endpoint and Priority from TARGET, current project state and any supplied instruction. Otherwise preserve legacy work without inventing an Endpoint; normal --instruct can establish it.
+- Before selecting any increment ask: "Does this materially advance the current SESSION Endpoint or unblock something required to reach it?" If no, defer it.
+- Prefer the smallest direct change that can achieve the current Completion, end-to-end product capability, demonstrated current needs, reuse, and bounded repairs. Leave adequate working subsystems alone. Among valid steps choose the largest meaningful user-visible or product-level progress toward the Endpoint, governed by Priority.
+- New abstractions, frameworks, compatibility machinery, hypothetical edge-case hardening and cleanup are justified only by the current Endpoint, a demonstrated defect, two or more concrete present uses, or safety/correctness of the direct implementation. Elegance alone is insufficient.
+- Blocker candidates are evidence to adjudicate as a real blocker, bounded repair, or deferred work; do not recursively redesign neighboring systems.
+$CANDIDATE_PROMPT
+
+Permanent blocker policy:
+- Implementation-reported blockers and planning-scope dead ends are candidates, not final decisions.
+- Review may authorize bounded technical repairs and expansion of MACHINE-GENERATED file restrictions within the existing user-authorized goal. Return PROBLEMS and describe that repair for Plan.
+- Never override explicit user constraints, permissions or access controls. TARGET changes require explicit user instruction. Human decisions and unavailable access remain BLOCKED.
+- Never invent missing evidence, source data, measurements or successful completion. A green test that expects a blocker does not establish the parent Completion.
+- BLOCKED means required progress depends on a concrete external action the authorized runtime cannot perform. Unattempted implementation/testing/rendering/capture/inspection is PROBLEMS. Repairable or ambiguous failure is PROBLEMS for diagnosis/repair/retry; an unresolved material fact is PROBLEMS for Plan to select a finite supported route. Capability absence must stop before Implement, never become capability diagnosis project work.
+- Neither missing evidence nor optimistic prose (Access ✓, Office installed, renderer exists) establishes capability availability or unavailability. Inspect structured controller/runtime receipts and their input bindings.
+- BLOCKED requires external_blocker: {fact, route, action, evidence:[{path,sha256,observation}]}. Cite a factual JSON receipt containing reviewed_head equal to HEAD and external_dependency: {fact,route,action,kind,check,inputs:[{path,sha256,observation}]}. kind is permission/access/external_artifact/external_approval; check is attempted/deterministic. The receipt must establish the external dependency for the required fact and checked autonomous route. Do not create receipts during Review or infer external action from generic failure kinds. HUMAN_ACTION and NEXT_STEP must equal the exact evidenced action.
+- BLOCKER_KEY is a stable short identifier for a current blocking finding; reuse it across equivalent repair attempts, regardless of step numbering. When AUTOCYCLE_REVIEW.blocking is false, NONE is allowed, including after a preserved candidate is resolved. Blocking findings require PROBLEMS or BLOCKED and a non-NONE key.
+- INPUT_STATUS concerns delivery of one-time steering: PENDING if any request still needs incorporation into a Plan, COMPLETE if every request is incorporated in a published Plan or independently verified satisfied, NONE for an empty frozen snapshot. Input consumption never establishes implementation acceptance; verify the original plan and all unfinished work separately.
+- Review is read-only. Only Plan can revise planning documents under explicit instruction authority; Cursor keeps TARGET.md, SESSION.md and IMPLEMENTATION.md read-only.
+- Local evidence may be uncommitted or unpushed after unsafe/failed checkpointing. Diagnose it without requiring a push; do not call preservation successful implementation.
 
 Inspect only what is necessary:
 - latest implementation diff
 - changed files
 - directly relevant tests/evidence
-- $LOG_DIR/latest-implementation, if present: use its log only if HEAD and branch match; assess actual verification, not todo labels alone
-- An implementation may legitimately produce no diff; evaluate acceptance against the current files and evidence.
+- $LOG_DIR/latest-implementation, if present: verify its branch and implementation baseline against HEAD or the preceding checkpoint (baseline must be an ancestor and the intervening commit must record this implementation). Assess the log and actual diff; do not ignore preceding implementation evidence merely because Checkpoint advanced HEAD. Missing or mismatched evidence cannot establish acceptance.
+- Read the same IMPLEMENTATION.md that Cursor followed, Cursor's RESULT.md and measured verification evidence, and the actual resulting diff/state. Cursor's completion claim is evidence, never an automatic pass.
+- Distinguish a requirement the plan stated but Cursor missed, something genuinely necessary that the plan omitted, and an additional improvement. If it is not required for this Step or Session Endpoint, defer it. Do not manufacture formal acceptance conditions for a prose plan.
+- An implementation may legitimately produce no diff; evaluate the actual plan requirements against current files and evidence.
+- If $LOG_DIR/remote-docs-current.json exists and its merged revision is HEAD, inspect its receipt and retained executed/remote plans. The merge preserves implementation work and imports owner-authored planning edits; it does not establish acceptance. Assess current behavior against the UPDATED TARGET and plan, including new requirements. Compare progress against the recorded original work objective; do not invent completion, replay one-time instructions, or require separation of the already-proven disjoint Git changes. Record any remaining implementation or acceptance gap for Plan.
 
 Avoid broad repository scans unless needed.
 
@@ -401,36 +513,107 @@ Do not modify files, implement, commit, push, or narrate your investigation.
 Return ONLY:
 
 REVIEW_STATUS: PASS | PROBLEMS | DONE | BLOCKED
-REVIEW: <maximum 25 words>
+REVIEW: <maximum 25 words: a concise finding normally; for DONE, a single line describing what this Session completed>
 NEXT_STEP: <one bounded next step, maximum 30 words, or NONE>
 REVIEWED_SHA: $SHA
+HUMAN_ACTION: <concrete human action for BLOCKED, otherwise NONE>
+BLOCKER_KEY: <stable obstacle identifier, or NONE>
+INPUT_STATUS: $EXPECTED_INPUT_STATUS
+AUTOCYCLE_REVIEW: <one JSON object as specified below>
+
+AUTOCYCLE_REVIEW must contain:
+- work_id and attempt_id: echo the controller work.id and attempt.id in AUTOCYCLE_WORK_CONTEXT; use "NONE" when absent. Never invent a replacement identity to escape unresolved work.
+- finding_key: the stable underlying finding, retaining the current work's key while unresolved.
+- blocking: JSON true only for concrete consequences preventing the current major-Step Completion or safe execution/verification; unrelated improvements are advisory. blocking_reason: the concrete consequence, otherwise "NONE".
+- Evaluate the major Step Completion in the same IMPLEMENTATION.md. COMPLETE means the parent Completion is achieved and closes the entire major, including all continuation sub-steps. Sub-steps have no independent Completion. Only Review closes work; Cursor results are evidence.
+- When AUTOCYCLE_WORK_CONTEXT has no checkpointed attempt, this is a valid opening Review, including after restart. Return outcome "UNASSESSED", reason "no checkpointed attempt exists to assess.", and evidence []; do not judge historical implementation as progress in this Session or invent a blocker from the absence of an attempt. Historical files can inform the new Plan and, when still applicable, the Session Endpoint assessment; they are not new attempt progress.
+- An attempt with kind "planning" preserves a Plan blocker candidate, not implementation progress. Return outcome "UNASSESSED" and adjudicate the candidate against current repository evidence through REVIEW_STATUS and NEXT_STEP. Missing same-Session implementation evidence cannot block the first implementation attempt.
+- outcome: "UNASSESSED" when no checkpointed attempt exists or the attempt is kind "planning"; for implementation attempts, "VERIFIED" for material change in evidence relevant to the parent Completion, "COMPLETE" for verified achievement of that Completion, "NONE" for no material progress, or "UNKNOWN" when evidence is insufficient. For legacy plans without Completion, inspect the original bounded work until Plan establishes Completion without reinterpreting that work.
+- reason: explain how the actual checkpointed result relates to the parent Completion. If unsatisfied, judge whether to keep pursuing it: reconsider the approach or a distinct bounded continuation; if the evidence shows the intermediate goal is inappropriate, use reviewed defer_work; material evidence can reveal a wrong route too. AUTOCYCLE_WORK_CONTEXT.stagnation is the advisory count of consecutive reviewed bounded attempts without material progress toward this Completion. NONE adds one for that attempt; VERIFIED or COMPLETE resets it. Re-review, resume, interruption, planning or a blocker candidate alone do not add attempts. UNKNOWN is not a no-progress judgment. Use the count to reconsider the approach and major-Step relevance, never as a threshold, ceiling, score, percentage or automatic decision. You judge progress; Cursor and Plan do not set the count. A commit, changed file, new test, rewritten status, changed ID or regenerated artifact alone is never progress. Documentation and investigation count when they satisfy the actual objective.
+- evidence: a JSON array of objects with path, sha256 (the actual current file SHA-256), and observation (the concrete test/measurement/result relevant to the original criterion). VERIFIED and COMPLETE require evidence you actually inspected. Paths must be in the repository or its AutoCycle evidence directory. Evidence can be a test log, structured metrics or the actual document/artifact; do not invent paths or hashes. Do not modify files to create evidence during Review.
+- Historical work may satisfy part of the Session Endpoint without being new progress in this attempt. AUTOCYCLE_WORK_CONTEXT.prior_reviews provides locators from retained reports (including earlier Sessions), not proof or inherited acceptance. Use their plan/checkpoint revisions to locate the original scope and factual evidence. Never cite work-state, a cached Review, or another derived acceptance summary as factual evidence.
+- To reuse a prior factual reference in evidence or endpoint.evidence, inspect the underlying file and retain its path and original sha256; add prior_attempt_id from the locator and applies_to: [{"path":"current relevant artifact or input","sha256":"hash bound by the historical facts","observation":"what this binding establishes"}]. Include all relevant source/input/artifact bindings, grounded in the historical receipt, snapshot or tested revision, not freshly chosen hashes of changed files. Explain in observation why the original check still establishes the CURRENT requirement, considering intervening changes, dependencies, environment and freshness. The controller checks referenced bytes, applicability hashes and revision ancestry; these checks alone do not establish semantic sufficiency.
+- Reuse unchanged, still-applicable facts without rerunning their producer. A previous COMPLETE/VERIFIED decision, an unchanged log, or commit ancestry alone is insufficient. Missing, changed, stale, failed or inapplicable facts cannot inherit acceptance. If applicability cannot be established, report the remaining semantic uncertainty through UNKNOWN/unresolved_facts or an actual blocking finding; do not claim Endpoint REACHED. Inspect current artifacts directly when they prove the requirement independently of historical acceptance. Historical evidence supports Endpoint acceptance separately from current-attempt progress.
+- When required evidence for the current parent Completion is missing and work remains blocking, return REVIEW_STATUS PROBLEMS (BLOCKED only with evidenced external dependency) and outcome UNKNOWN (UNASSESSED only when no checkpointed implementation attempt exists). Never use VERIFIED or COMPLETE with nonempty unresolved_facts, even if other partial progress is proven. Preserve that partial evidence and the genuine blockers; endpoint.status remains UNREACHED.
+- Review owns semantic truth. Identify the actual fact required by parent Completion / Session Endpoint, decide materiality, and combine all admissible applicable evidence. Multiple authenticated native page observations may establish whole-document readability; no bespoke whole-document or aggregate receipt is required. Provenance is not an additional product criterion.
+- State remaining material semantic uncertainty in unresolved_facts: [{"fact":"exact semantic uncertainty", "material_reason":"why current Completion or Endpoint requires it"}]. Use [] for established, immaterial or obsolete facts. Never create fact: "unclassified". Legacy unclassified state is context for fresh ordinary Review, never an execution task or a requirement to retain an obsolete evidence method.
+- Legacy observation associations in AUTOCYCLE_WORK_CONTEXT.legacy_observation_review are historical provenance, not a current verdict. Inspect applicable evidence; do not treat rejected captures as new observations. If needed, request a supported read-only observation in this same Review. Never emit retry_observations or observation_recovery_id.
+- missing_evidence is not a Review output channel; omit it or use []. Plan chooses the smallest finite supported route for unresolved_facts; the AutoCycle Controller validates executability before Implement. If no supported finite route exists, the Controller stops with a verification-capability gap, not recurring project work. Do not invent a verifier or require AutoCycle repairs as project acceptance.
+- Inspect actual receipt outputs and applicable observations, not only producer status, request IDs, hashes, timestamps or ancestry. Generic producer JSON cannot establish an arbitrary semantic claim merely by matching requirement text. FAILED describes an execution result; UNAVAILABLE is not a recurring missing_evidence obligation. Real evidenced external dependencies retain existing BLOCKED behavior.
+- Reuse admissible evidence when relevant artifacts, inputs, dependencies and environment remain applicable. A later Review boundary or timestamp alone never invalidates evidence. Require fresh observations for changed relevant inputs, independently changing conditions, or an explicit current-observation acceptance criterion. Reject stale or inapplicable observations. Include hash-bound applicability references in applies_to when reusing observations.
+- Workbook navigation uses the existing Office Bridge navigation request: {"app":"excel","source":"path/to/source.xlsx","worksheet":"Start","operation":"navigation","requirement":{"fact":"workbook_navigation","source":"path/to/source.xlsx","source_sha256":"current hash","worksheet":"Start","links":[{"cell":"A2","sheet":"Detail","range":"A1"}],"return_sheet":"Start"}}. Plan derives expected destinations from authoritative requirements, generating code and workbook structure. Review judges the actual native transitions; receipts establish provenance, not higher-level acceptance. Readability remains a visual semantic judgment.
+- recovery: "NONE" normally. If blocked, "NEW_EVIDENCE" requires verified progress backed by newly inspected evidence; "REVISED_APPROACH" requires explicit new human instructions authorizing a concrete different approach, with recovery_instruction_ids drawn from new_instruction_ids and a concrete recovery_reason. Mere reruns or unrelated new instructions do not clear a block.
+- recovery_instruction_ids: [] unless using REVISED_APPROACH. recovery_reason: "NONE" unless recovering.
+If verification_only is true, this is the read-only progress recheck. Do not repair the progress mechanism. Unresolved verification requires PROBLEMS for bounded diagnosis; only evidenced external dependency permits BLOCKED.
+Without SESSION.md, DONE requires current-work COMPLETE when an attempt exists. With a Session, first assess the current major Completion. Once achieved, close the entire major and evaluate the Session Endpoint. A verified already-satisfied Endpoint can also end a Session when no current major exists. Never falsely report unfinished work COMPLETE. Only opening Review judges Endpoint completion from the actual checkpointed state and SESSION.md, never merely Cursor success. When SESSION.md exists, report its Endpoint assessment each Review, but do not claim REACHED while the active major Completion remains unsatisfied: include endpoint: {"status":"REACHED|UNREACHED","session_sha256":"actual SESSION.md SHA-256","evidence":[objects with path, sha256, observation]}. REACHED requires inspected evidence of all Endpoint acceptance and MUST return DONE unless frozen instructions are PENDING incorporation; in that case return PASS/PROBLEMS and let Plan persist their changes before evaluating completion again. TARGET may remain unfinished. UNREACHED must not return DONE. Without SESSION.md retain legacy all-TARGET completion semantics. Unused cycles never justify more work. For a fresh session (flag 1), return PASS/PROBLEMS to derive the new Endpoint and Priority from TARGET, current project state and supplied instructions and replan; never accept the previous session Endpoint.
+PROBLEMS with blocking=false records advisory findings; Plan should select the highest-priority authorized objective, not a recursive administrative repair.
 PROMPT_EOF
-)
+    PROMPT=${PROMPT%$'\n'}
 
-    set +e
-    codex exec --sandbox read-only "$PROMPT" \
-        >"$REVIEW_LOG" 2>&1
-    EXIT_CODE=$?
-    set -e
+    local BASE_PROMPT="$PROMPT" BASE_LOG="$REVIEW_LOG"
+    local REVIEW_ATTEMPT VALIDATION_FAILURE PROGRESS_SUMMARY
+    for REVIEW_ATTEMPT in 1 2 3; do
+        # Separate immutable answers/logs; never append a correction to rejected JSON.
+        REVIEW_LOG="$BASE_LOG.attempt-$REVIEW_ATTEMPT"
+        ANSWER="$REVIEW_LOG.answer"
+        local PREFLIGHT_REPORT
+        if ! PREFLIGHT_REPORT=$(printf '%s\0' prompt "$PROMPT" office_locator "$OFFICE_EVIDENCE" \
+                excel_locator "$EXCEL_EVIDENCE" human_input "$HUMAN_INPUT_PROMPT" \
+                input_context "$INPUT_CONTEXT_PROMPT" work_context "$STEP_INDEX_PROMPT" \
+                project_history "$PROJECT_HISTORY" candidate "$CANDIDATE_PROMPT" |
+                python3 "$(dirname "$ADJUDICATOR")/native_office.py" review-preflight 2>&1); then
+            fail "$PREFLIGHT_REPORT"
+        fi
+        set +e
+        printf '%s' "$PROMPT" |
+            adjudication run "${AUTOCYCLE_PROVIDER_TIMEOUT:-900}" codex exec --sandbox read-only --output-last-message "$ANSWER" - \
+            >"$REVIEW_LOG" 2>&1
+        EXIT_CODE=$?
+        set -e
+        if [[ "$EXIT_CODE" -ne 0 ]]; then
+            provider_failure "Codex review unsuccessful (exit $EXIT_CODE; 124 means timed out). Log: $REVIEW_LOG" "$REVIEW_LOG"
+        fi
+        # Changed repository/input/evidence is not a serialization error to retry.
+        [[ "$(git rev-parse HEAD)" == "$SHA" ]] || fail "HEAD changed during review."
+        [[ "$(adjudication identity "${AUTOCYCLE_INPUT_BATCH:-}")" == "$REVIEW_IDENTITY" ]] \
+            || fail "repository or evidence changed during review; decision discarded."
+        if grep -q '^OBSERVER_REQUEST:' "$ANSWER"; then
+            adjudication observe-request Review < "$ANSWER" || fail "invalid Review Observer request."
+            live_stop_timer
+            exit 77
+        fi
+        if PROGRESS_SUMMARY=$(validate_review_response); then
+            break
+        fi
+        VALIDATION_FAILURE="$PROGRESS_SUMMARY"
+        printf '%s\n' "$VALIDATION_FAILURE" > "$REVIEW_LOG.validation"
+        [[ "$REVIEW_ATTEMPT" -lt 3 ]] \
+            || fail "$VALIDATION_FAILURE; Review correction retry limit exhausted; evidence preserved. Log: $REVIEW_LOG"
+        PROMPT="$BASE_PROMPT
 
-    if [[ "$EXIT_CODE" -ne 0 ]]; then
-        tail -n 15 "$REVIEW_LOG"
-        fail "Codex review. Log: $REVIEW_LOG"
-    fi
+Review validation failure: $VALIDATION_FAILURE
+The rejected response is preserved at $ANSWER. Correct its serialization/adjudication and return the full Review response using the unchanged checkpoint context above. This is Review-only recovery; do not rerun Implement, modify files, invent evidence, remove genuine missing requirements, weaken parent Completion, or claim success to satisfy validation. Required missing evidence must remain unresolved."
+    done
 
-    load_review "$REVIEW_LOG" \
-        || fail "invalid Codex review. Log: $REVIEW_LOG"
-
-    [[ "$(git rev-parse HEAD)" == "$SHA" ]] \
-        || fail "HEAD changed during review."
-
-    [[ -z "$(git status --porcelain)" ]] \
-        || fail "repository changed during review."
-
+    load_review "$ANSWER"
+    INPUT_STATUS=$(sed -n 's/^INPUT_STATUS: //p' "$ANSWER")
+    HUMAN_ACTION=$(sed -n 's/^HUMAN_ACTION: //p' "$ANSWER")
+    BLOCKER_KEY=$(sed -n 's/^BLOCKER_KEY: //p' "$ANSWER")
+    # The canonical validator checks the current blocking finding. A retained
+    # candidate is historical evidence, not an unconditional veto on acceptance.
+    REVIEW_TOKEN=$(python3 -c 'import uuid;print(uuid.uuid4().hex)')
+    PROGRESS_RECORD=$(sed -n '/^AUTOCYCLE_REVIEW: /p' "$ANSWER")
     printf '\nAUTOCYCLE_REVIEW_INPUT: %s\n' "${AUTOCYCLE_INPUT_KEY:-}" >> "$REVIEW_LOG"
     write_review_cache
 
-    live_done "Found: $REVIEW_TEXT"
+    if [[ "${AUTOCYCLE_CONTROLLER_REVIEW:-}" == 1 ]]; then
+        live_stop_timer
+    elif [[ "$STATUS" == BLOCKED ]]; then
+        live_done "Blocked: $REVIEW_TEXT; Action: $HUMAN_ACTION"
+    else
+        live_done "${PROGRESS_SUMMARY:-$REVIEW_TEXT}"
+    fi
+
 }
 
 # ============================================================
@@ -438,6 +621,15 @@ PROMPT_EOF
 # ============================================================
 
 run_plan() {
+    local GUARD_RESULT GUARD_RC
+    set +e
+    GUARD_RESULT=$(progress guard "$CACHE_FILE" "${AUTOCYCLE_INPUT_BATCH:-}")
+    GUARD_RC=$?
+    set -e
+    if [[ "$GUARD_RC" != 0 ]]; then
+        echo "BLOCKED     $GUARD_RESULT"
+        exit "$GUARD_RC"
+    fi
     live_start "Plan"
 
     local T
@@ -448,30 +640,51 @@ run_plan() {
     local FIRST_LINE
 
     T=$(timestamp)
-    PLAN_LOG="$LOG_DIR/plan-$T.log"
+    PLAN_LOG="$LOG_DIR/plan-$T-$$.log"
+    local ANSWER="$PLAN_LOG.answer"
     PLAN_FILE="$LOG_DIR/IMPLEMENTATION-$T.md"
 
-    PROMPT=$(cat <<PROMPT_EOF
+    IFS= read -r -d '' PROMPT <<PROMPT_EOF || true
 Create the next IMPLEMENTATION.md from:
 
 SHA: $SHA
 STATUS: $STATUS
 REVIEW: $REVIEW_TEXT
 NEXT_STEP: $NEXT_STEP
+$(sed -n '/^AUTOCYCLE_REVIEW: /p' "$CACHE_FILE")
 
 $HUMAN_INPUT_PROMPT
 $STEP_INDEX_PROMPT
-Read existing IMPLEMENTATION.md, TARGET.md, and directly relevant files only as needed.
+$PROJECT_HISTORY
+
+Persistence and planning discipline:
+- TARGET.md is the project destination. SESSION.md holds this session Endpoint and Priority. IMPLEMENTATION.md holds only current bounded work.
+- During Review classify each undelivered instruction by actual effect: target, endpoint, priority, implementation; a request can affect several levels. Classify every ID still needing incorporation, using implementation for concrete execution guidance; never reuse delivered IDs. For independently satisfied inputs (INPUT_STATUS COMPLETE), use an empty direction object and do not request document changes. Record direction as a JSON object mapping those levels to exact instruction IDs in AUTOCYCLE_REVIEW. Plan follows those bindings through the existing instruction mechanism.
+- If an explicit Target, Endpoint or Priority amendment makes unresolved work irrelevant, Review may include defer_work: {"work_id":"current work.id","instruction_ids":["authorizing direction instruction IDs"],"reason":"why the amendment defers this work relative to the Endpoint"}. Preserve its original plan and evidence in the ledger; deferral is not completion and cannot clear a missing-evidence block. Review may also use defer_work with empty instruction_ids after outcome NONE or VERIFIED when the evidence shows the intermediate goal is no longer a sensible route to the Session Endpoint; give the concrete relevance reason. Difficulty alone does not justify replacement. Plan may start a different major only after closure or this reviewed deferral; do not carry deferred ancestry into IMPLEMENTATION.md.
+- Target changes never invent a new Endpoint. Reconcile the existing Session and report an actual conflict for a human decision. Priority-only changes leave TARGET unchanged; technique-only changes leave TARGET and SESSION unchanged.
+- Endpoint and Priority persist until explicitly changed; record their changes in SESSION.md, never only in queue receipts. On an ordinary start or explicit --restart, derive a new Endpoint and Priority from TARGET, current project state and any supplied instruction. Otherwise preserve legacy work without inventing an Endpoint; normal --instruct can establish it.
+- Before selecting any increment ask: "Does this materially advance the current SESSION Endpoint or unblock something required to reach it?" If no, defer it.
+- Prefer the smallest direct change that can achieve the current Completion, end-to-end product capability, demonstrated current needs, reuse, and bounded repairs. Leave adequate working subsystems alone. Among valid steps choose the largest meaningful user-visible or product-level progress toward the Endpoint, governed by Priority.
+- New abstractions, frameworks, compatibility machinery, hypothetical edge-case hardening and cleanup are justified only by the current Endpoint, a demonstrated defect, two or more concrete present uses, or safety/correctness of the direct implementation. Elegance alone is insufficient.
+- Blocker candidates are evidence to adjudicate as a real blocker, bounded repair, or deferred work; do not recursively redesign neighboring systems.
+Read existing IMPLEMENTATION.md, SESSION.md, TARGET.md, and directly relevant files only as needed.
 
 Rules:
 - One bounded implementation step.
-- Cursor must never modify TARGET.md or IMPLEMENTATION.md.
+- Review can authorize bounded technical repair and expansion of machine-generated file restrictions within the existing user-authorized goal. It cannot override explicit user constraints, permissions or access controls; TARGET changes require explicit user instruction.
+- Preserve the parent work identity and Completion until Review closes it or explicitly defers an inappropriate intermediate goal. A new major introduces a new Completion. A distinct continuation changes its bounded implementation objective and keeps the parent Completion; simply continuing the same attempt keeps its ID.
+- Preserve unfinished commitments and still-applicable constraints from the current plan, including its AUTOCYCLE_PLAN.inputs commitments. Carry these into the new plan until satisfied or explicitly superseded; do not restart completed one-time actions. Record remaining scope when an input requires more than this bounded step.
+- Missing evidence must not be invented; human decisions and unavailable access remain blockers.
+- When the current work is absent or provisional, inherited IMPLEMENTATION.md is context, not an admitted current-Session attempt requiring progress or closure. Plan the first bounded implementation from current repository state, preserving applicable user constraints and unfinished obligations.
+- For each Review unresolved_facts entry, preserve its exact fact and criterion. Add evidence_routes to AUTOCYCLE_PLAN: [{"fact":"the unchanged Review fact", "evidence":[existing {path,sha256,observation,applies_to} references], "commands":[["existing executable","existing check script","args"]], "requests":[existing Office Bridge request objects]}]. Omit unused lists. Respect Session Priority and dependencies; a low-level blocker does not automatically outrank useful endpoint work. Prefer applicable existing evidence, then a finite set of supported inspections/checks/tests/captures, then a product change only for an actual defect. Commands must use installed executables and existing project checks; never invent a verifier or create AutoCycle infrastructure. Native captures/navigation go through Office Bridge, not arbitrary Office shell commands. Plan's finite request/command lists are execution instructions, never a new acceptance standard.
+- When no finite supported route exists, emit a normal plan block retaining the parent Completion and include evidence_routes: [{"fact":"exact Review fact","missing_capability":"specific missing AutoCycle mechanism; explain why no finite supported route could be constructed"}]. The Controller will stop before publishing or Implement with a verification-capability gap. Do not use PLAN_STATUS BLOCKED for capability absence or turn it into an implementation objective.
+- If no authorized bounded plan is possible, output PLAN_STATUS: BLOCKED followed by BLOCKER: <concrete reason>, without a plan block. This is a candidate for read-only Review, not a final decision.
+- Cursor must never modify TARGET.md, SESSION.md or IMPLEMENTATION.md.
 - Direct completion records and measured verification to RESULT.md.
 - Read RESULT.md when assessing the previous step.
-- If STATUS is PROBLEMS, repair it before advancing.
+- Follow Review's Completion-relative blocker adjudication: defer irrelevant candidates; repair only what directly prevents the unchanged Completion; use a distinct continuation only when warranted; select a new major only after reviewed closure or deferral of the wrong route. Do not independently treat Cursor's candidate as a blocker or change Completion to escape difficulty. Preserve ownership and recovery guards. Record advisory findings and choose the highest-priority remaining authorized work. Numbering or wording alone cannot demand another implementation cycle.
 - Preserve useful project-specific naming/conventions.
-- Prefer 2-4 concrete tasks.
-- Include only necessary files, actions, tests, and acceptance criteria.
+- The only required bounded-work criterion is one concise ## Completion statement in IMPLEMENTATION.md. It belongs to the major Step, never SESSION.md or a sub-step. Beyond this statement, choose the amount of detail the work needs; no fixed template, acceptance criteria, checklist, tests, evidence prescription or Done when section is required. Optional acceptance guidance and mandatory checks remain ordinary plan content. Cursor chooses reasonable verification unless you explicitly require a check.
 - Omit rationale, history, repetition, and obvious instructions.
 - Aim for no more than about 60 lines.
 - Do not implement, modify files, commit, or push.
@@ -480,40 +693,57 @@ Rules:
 Output ONLY:
 
 BEGIN_IMPLEMENTATION_MD
-<complete IMPLEMENTATION.md>
+<complete IMPLEMENTATION.md with a concise objective heading and whatever prose detail the bounded work needs.
+Only when undelivered instructions exist, include one line AUTOCYCLE_PLAN: {"inputs":[{"id":"exact instruction ID","commitment":"concrete incorporation and remaining scope"}]}. Include every undelivered ID exactly once; this is the existing delivery receipt, not an acceptance schema.
+An optional AUTOCYCLE_PLAN record may specify minor: 1 for the first distinct continuation after Review of the initial major attempt, then minor: 2, etc. Initial major work has no minor; omit minor to continue the same bounded attempt. The controller stamps IDs and identity metadata. Do not manufacture acceptance fields.>
 END_IMPLEMENTATION_MD
+For explicitly instructed changes authorized by Review direction, append BEGIN_TARGET_MD / END_TARGET_MD and/or BEGIN_SESSION_MD / END_SESSION_MD blocks with the entire corresponding Markdown document. Omit unchanged documents. SESSION.md stays small: optional Session: ${AUTOCYCLE_SESSION_NUMBER:-1}, ## Endpoint, optional acceptance bullets, ## Priority. Preserve sections not explicitly changed.
+For a fresh session (${AUTOCYCLE_NEW_SESSION:-0}), a new SESSION block and fresh bounded work are required. Derive Endpoint and Priority from TARGET.md, current project state and supplied instructions; no Endpoint instruction is required. TARGET persists unchanged unless explicitly instructed. Never start a new Session automatically after completion.
 PROMPT_EOF
-)
+    PROMPT=${PROMPT%$'\n'}
 
     set +e
-    codex exec --sandbox read-only "$PROMPT" \
+    printf '%s' "$PROMPT" |
+        adjudication run "${AUTOCYCLE_PROVIDER_TIMEOUT:-900}" codex exec --sandbox read-only --output-last-message "$ANSWER" - \
         >"$PLAN_LOG" 2>&1
     EXIT_CODE=$?
     set -e
 
     if [[ "$EXIT_CODE" -ne 0 ]]; then
-        tail -n 15 "$PLAN_LOG"
-        fail "Codex planning. Log: $PLAN_LOG"
+        if [[ ! -t 1 ]]; then tail -n 15 "$PLAN_LOG"; fi
+        provider_failure "Codex planning. Log: $PLAN_LOG" "$PLAN_LOG"
     fi
 
-    if grep -q '^PLAN_STATUS: BLOCKED$' "$PLAN_LOG"; then
-        live_fail
-        echo "BLOCKED: planner could not reconcile the active instructions. Log: $PLAN_LOG"
-        exit 2
+    if grep -q '^PLAN_STATUS:' "$ANSWER"; then
+        [[ "$(grep -c '^PLAN_STATUS:' "$ANSWER")" == 1 ]] && grep -qx 'PLAN_STATUS: BLOCKED' "$ANSWER" \
+            || fail "malformed planning status."
+        [[ "$(grep -c '^BLOCKER: .\+' "$ANSWER" || true)" == 1 ]] || fail "planning blocker lacks reason."
+        ! grep -Eq '^(BEGIN_IMPLEMENTATION_MD|END_IMPLEMENTATION_MD)$' "$ANSWER" || fail "mixed planning blocker and implementation block."
+        local ROUTE_RC=0 ROUTE_RESULT
+        ROUTE_RESULT=$(progress plan-unavailable "$ANSWER" "$CACHE_FILE") || ROUTE_RC=$?
+        if [[ "$ROUTE_RC" == 78 ]]; then
+            live_finish "✗" "$ROUTE_RESULT"
+            exit 78
+        fi
+        [[ "$ROUTE_RC" == 3 ]] || fail "invalid planning inability report."
+        adjudication candidate planning "$ANSWER" "${AUTOCYCLE_INPUT_BATCH:-}" || fail "cannot preserve planning blocker."
+        live_finish "↪" "Blocker candidate → Review"
+        exit 42
     fi
 
-    # The transcript contains our prompt too.
-    # Use the LAST marker pair, which belongs to Codex's answer.
+    # Parse only the final answer, with exactly one unambiguous marker pair.
+    [[ "$(grep -c '^BEGIN_IMPLEMENTATION_MD$' "$ANSWER" || true)" == 1 && \
+       "$(grep -c '^END_IMPLEMENTATION_MD$' "$ANSWER" || true)" == 1 ]] || fail "ambiguous planning markers."
 
     BEGIN_LINE=$(
-        grep -n '^BEGIN_IMPLEMENTATION_MD$' "$PLAN_LOG" \
+        grep -n '^BEGIN_IMPLEMENTATION_MD$' "$ANSWER" \
             | tail -n 1 \
             | cut -d: -f1 \
             || true
     )
 
     END_LINE=$(
-        grep -n '^END_IMPLEMENTATION_MD$' "$PLAN_LOG" \
+        grep -n '^END_IMPLEMENTATION_MD$' "$ANSWER" \
             | tail -n 1 \
             | cut -d: -f1 \
             || true
@@ -529,7 +759,7 @@ PROMPT_EOF
         || fail "planner returned malformed markers."
 
     sed -n "$((BEGIN_LINE + 1)),$((END_LINE - 1))p" \
-        "$PLAN_LOG" > "$PLAN_FILE"
+        "$ANSWER" > "$PLAN_FILE"
 
     [[ -s "$PLAN_FILE" ]] \
         || fail "planner returned an empty IMPLEMENTATION.md."
@@ -538,6 +768,19 @@ PROMPT_EOF
 
     [[ "$FIRST_LINE" == \#* ]] \
         || fail "generated IMPLEMENTATION.md has no heading."
+    progress plan-documents "$ANSWER" "$PLAN_FILE" "$CACHE_FILE" "${AUTOCYCLE_INPUT_BATCH:-}" || fail "invalid instructed document change."
+    local ADMISSION_RC=0 ADMISSION_RESULT
+    ADMISSION_RESULT=$(progress prepare "$PLAN_FILE" "$CACHE_FILE") || ADMISSION_RC=$?
+    if [[ "$ADMISSION_RC" == 78 ]]; then
+        live_finish "✗" "$ADMISSION_RESULT"
+        exit 78
+    fi
+    [[ "$ADMISSION_RC" == 0 ]] || fail "invalid bounded plan."
+    PLAN_ACTION=$(progress plan-action "$PLAN_FILE") || fail "cannot determine plan continuation."
+    if [[ -n "${AUTOCYCLE_INPUT_KEY:-}" ]]; then
+        python3 "$QUEUE_HELPER" --dir "$LOG_DIR" validate-plan "$AUTOCYCLE_INPUT_KEY" "$PLAN_FILE" \
+            || fail "plan did not incorporate the frozen instructions; input preserved."
+    fi
 }
 
 # ============================================================
@@ -554,7 +797,7 @@ push_plan() {
         fail "refusing to push an automated plan directly to $BRANCH."
     fi
 
-    git fetch --prune origin >/dev/null 2>&1 \
+    autocycle_git fetch --prune origin >/dev/null 2>&1 \
         || fail "could not refresh origin."
 
     REMOTE_NOW=$(git rev-parse "origin/$BRANCH")
@@ -577,11 +820,20 @@ push_plan() {
         || fail "could not create planning worktree."
 
     cp "$PLAN_FILE" "$WORKTREE/IMPLEMENTATION.md"
+    for DOCUMENT in TARGET SESSION; do
+        if [[ -f "$PLAN_FILE.$DOCUMENT" ]]; then
+            cp "$PLAN_FILE.$DOCUMENT" "$WORKTREE/$DOCUMENT.md"
+        fi
+    done
 
     CHANGES=$(git -C "$WORKTREE" status --porcelain)
 
-    [[ -n "$CHANGES" ]] \
-        || fail "new IMPLEMENTATION.md is identical to the old one."
+    if [[ -z "$CHANGES" ]]; then
+        printf 'PLAN_STATUS: BLOCKED\nBLOCKER: generated plan is identical; no authorized progress was planned.\n' > "$PLAN_FILE.blocker"
+        adjudication candidate planning "$PLAN_FILE.blocker" "${AUTOCYCLE_INPUT_BATCH:-}" || fail "cannot preserve planning dead end."
+        live_finish "↪" "Unchanged plan → Review"
+        exit 42
+    fi
 
     CHANGED_PATHS=$(
         git -C "$WORKTREE" status --porcelain \
@@ -589,12 +841,15 @@ push_plan() {
             | sort -u
     )
 
-    if [[ "$CHANGED_PATHS" != "IMPLEMENTATION.md" ]]; then
-        echo "$CHANGES"
-        fail "planning changed files other than IMPLEMENTATION.md."
+    if printf '%s\n' "$CHANGED_PATHS" | grep -Ev '^(IMPLEMENTATION|TARGET|SESSION)\.md$' >/dev/null; then
+        if [[ ! -t 1 ]]; then echo "$CHANGES"; fi
+        fail "planning changed files outside the three planning documents."
     fi
 
     git -C "$WORKTREE" add IMPLEMENTATION.md
+    for DOCUMENT in TARGET SESSION; do
+        if [[ -f "$PLAN_FILE.$DOCUMENT" ]]; then git -C "$WORKTREE" add "$DOCUMENT.md"; fi
+    done
 
     PLAN_TITLE=$(
         head -n 1 "$PLAN_FILE" \
@@ -615,7 +870,7 @@ push_plan() {
     PLAN_SHA=$(git -C "$WORKTREE" rev-parse HEAD)
     PLAN_SHORT_SHA=$(git -C "$WORKTREE" rev-parse --short HEAD)
 
-    git fetch --prune origin >/dev/null 2>&1 \
+    autocycle_git fetch --prune origin >/dev/null 2>&1 \
         || fail "could not perform final remote check."
 
     REMOTE_NOW=$(git rev-parse "origin/$BRANCH")
@@ -623,12 +878,16 @@ push_plan() {
     [[ "$REMOTE_NOW" == "$SHA" ]] \
         || fail "GitHub changed before planning push."
 
-    git -C "$WORKTREE" push origin \
-        "HEAD:refs/heads/$BRANCH" \
+    if [[ -n "${AUTOCYCLE_PLAN_RESULT:-}" ]]; then
+        printf '%s %s\n' "$PLAN_SHA" "$BRANCH" > "$AUTOCYCLE_PLAN_RESULT.tmp.$$"
+        mv "$AUTOCYCLE_PLAN_RESULT.tmp.$$" "$AUTOCYCLE_PLAN_RESULT"
+    fi
+    autocycle_git -C "$WORKTREE" push origin \
+        "$PLAN_SHA:refs/heads/$BRANCH" \
         >/dev/null 2>&1 \
         || fail "could not push planning commit."
 
-    git fetch origin "$BRANCH" >/dev/null 2>&1
+    autocycle_git fetch origin "$BRANCH" >/dev/null 2>&1
 
     [[ "$(git rev-parse "origin/$BRANCH")" == "$PLAN_SHA" ]] \
         || fail "planning push could not be verified."
@@ -647,35 +906,6 @@ push_plan() {
 }
 
 # ============================================================
-# Sync
-# ============================================================
-
-run_sync() {
-    local OUTPUT
-    local EXPECTED_BRANCH
-
-    EXPECTED_BRANCH="$BRANCH"
-
-    if ! OUTPUT=$(sync 2>&1); then
-        echo "$OUTPUT"
-        fail "sync"
-    fi
-
-    BRANCH=$(git branch --show-current)
-    SHA=$(git rev-parse HEAD)
-    SHORT_SHA=$(git rev-parse --short HEAD)
-
-    [[ "$BRANCH" == "$EXPECTED_BRANCH" ]] \
-        || fail "sync unexpectedly switched branches."
-
-    [[ "$SHA" == "$PLAN_SHA" ]] \
-        || fail "sync did not reach planning commit $PLAN_SHORT_SHA."
-
-    [[ -z "$(git status --porcelain)" ]] \
-        || fail "working tree is not clean after sync."
-}
-
-# ============================================================
 # Cursor implementation using ACP
 # ============================================================
 
@@ -691,7 +921,7 @@ def git(*args):
 try:
     baseline = git('rev-parse', '--verify', sys.argv[1] + '^{commit}').strip().decode()
     root = Path(os.fsdecode(git('rev-parse', '--show-toplevel').rstrip(b'\n')))
-    for name in ('TARGET.md', 'IMPLEMENTATION.md'):
+    for name in ('TARGET.md', 'SESSION.md', 'IMPLEMENTATION.md'):
         tree = git('ls-tree', '-z', baseline, '--', name)
         index = git('ls-files', '--stage', '-z', '--', name)
         path = root / name
@@ -723,13 +953,21 @@ OWNERSHIP_PY
 
 run_cursor() {
     local ATTEMPT="${1:-1}"
+    if [[ -z "${AUTOCYCLE_DISPLAY_STATE:-}" ]]; then
+        AUTOCYCLE_DISPLAY_STATE=$(mktemp "$LOG_DIR/stage-display.XXXXXX")
+        export AUTOCYCLE_DISPLAY_STATE
+    fi
+    node "$(dirname "$ADJUDICATOR")/stage_display.js" "$AUTOCYCLE_DISPLAY_STATE" Implement clock >/dev/null
     local T
     local CURSOR_LOG
     local BEFORE_SHA
     local EXIT_CODE
 
     T=$(timestamp)
-    CURSOR_LOG="$LOG_DIR/cursor-$T.log"
+    CURSOR_LOG="$LOG_DIR/cursor-$T-$$.log"
+    BEFORE_SHA=$(git rev-parse HEAD)
+    progress begin "$BEFORE_SHA" "${AUTOCYCLE_INPUT_BATCH:-}" || fail "work/attempt admission failed; preserve state and resume Review."
+    adjudication baseline || fail "cannot preserve implementation baseline."
     BEFORE_SHA=$(git rev-parse HEAD)
     assert_owned_docs "$BEFORE_SHA"
 
@@ -740,10 +978,13 @@ run_cursor() {
 
     set +e
 
-    node - "$ROOT" "$CURSOR_LOG" <<'NODE'
+    node - "$ROOT" "$CURSOR_LOG" "$(dirname "$ADJUDICATOR")/implementation_response.js" <<'NODE'
 const { spawn, execFileSync } = require("node:child_process");
 const readline = require("node:readline");
 const fs = require("node:fs");
+const { ImplementationResponse, transportError } = require(process.argv[4]);
+const adjudicator = require("node:path").join(require("node:path").dirname(process.argv[4]), "adjudication.py");
+const observerEvidence = execFileSync("python3", [require("node:path").join(require("node:path").dirname(adjudicator), "native_office.py"), "review-evidence"], {encoding:"utf8"});
 
 const root = process.argv[2];
 const logFile = process.argv[3];
@@ -769,7 +1010,8 @@ if (
 }
 
 const log = fs.createWriteStream(logFile, { flags: "a" });
-const started = Date.now();
+const { StageDisplay } = require(require('node:path').join(require('node:path').dirname(process.argv[4]), 'stage_display.js'));
+const display = new StageDisplay(process.env.AUTOCYCLE_DISPLAY_STATE, 'Implement');
 
 let nextId = 1;
 const pending = new Map();
@@ -777,101 +1019,15 @@ const pending = new Map();
 const todos = new Map();
 let todoOrder = [];
 
-let renderedLines = 0;
 let finished = false;
 let shuttingDown = false;
 let retryableStall = false;
-
-function elapsed() {
-  const seconds = Math.floor((Date.now() - started) / 1000);
-  const minutes = Math.floor(seconds / 60);
-  const secs = seconds % 60;
-
-  return (
-    String(minutes).padStart(2, "0") +
-    ":" +
-    String(secs).padStart(2, "0")
-  );
-}
-
-function shorten(text) {
-  let value = String(text || "")
-    .replace(/\s+/g, " ")
-    .replace(/[.:;]+$/, "")
-    .trim();
-
-  if (value.length > 42) {
-    value = value.slice(0, 39).trimEnd() + "...";
-  }
-
-  return value;
-}
-
-function icon(status) {
-  switch (status) {
-    case "completed":
-      return "✓";
-    case "in_progress":
-      return "▶";
-    case "cancelled":
-      return "–";
-    default:
-      return "○";
-  }
-}
-
-function displayItems() {
-  const real = todoOrder
-    .map(id => todos.get(id))
-    .filter(Boolean);
-
-  if (real.length > 0) {
-    return real;
-  }
-
-  return [{
-    id: "fallback",
-    content: finished ? "Implementation" : "Working",
-    status: finished ? "completed" : "in_progress"
-  }];
-}
-
-function linesForDisplay() {
-  return [
-    finished ? `Implement   ✓ ${elapsed()}` : `Implement   ${elapsed()}`,
-    ...displayItems().map(item =>
-      `    ${icon(item.status)} ${shorten(item.content)}`)
-  ];
-}
+const response = new ImplementationResponse();
 
 function redraw(forceFinal = false) {
-  const lines = linesForDisplay();
-
-  if (!process.stdout.isTTY) {
-    if (forceFinal) {
-      process.stdout.write(lines.join("\n") + "\n");
-    }
-    return;
-  }
-
-  if (renderedLines > 0) {
-    process.stdout.write(`\x1b[${renderedLines}A`);
-  }
-
-  const height = Math.max(renderedLines, lines.length);
-
-  for (let i = 0; i < height; i++) {
-    const line = lines[i] || "";
-    process.stdout.write(`\x1b[2K\r${line}\n`);
-  }
-
-  if (height > lines.length) {
-    process.stdout.write(
-      `\x1b[${height - lines.length}A`
-    );
-  }
-
-  renderedLines = lines.length;
+  display.tasks(todoOrder.map(id => todos.get(id)).filter(Boolean));
+  if (forceFinal) display.clearTimer();
+  if (forceFinal && finished) display.tick();
 }
 
 function mergeTodos(incoming, merge) {
@@ -894,8 +1050,21 @@ function mergeTodos(incoming, merge) {
 
 const agent = spawn("agent", ["acp"], {
   cwd: root,
+  detached: true,
   stdio: ["pipe", "pipe", "pipe"]
 });
+
+let agentClosed = false;
+agent.on("close", () => { agentClosed = true; });
+// The provider has its own process group so transport recovery can stop tools.
+// Forward controller termination too; a forced stop creates no resume receipt.
+for (const [signal, code] of [["SIGTERM", 143], ["SIGINT", 130]]) {
+  process.once(signal, () => {
+    shuttingDown = true;
+    try { process.kill(-agent.pid, "SIGTERM"); } catch {}
+    log.end(() => process.exit(code));
+  });
+}
 
 agent.stderr.on("data", chunk => {
   log.write(`[stderr] ${chunk}`);
@@ -946,10 +1115,12 @@ rl.on("line", line => {
   const updateText =
     msg?.params?.update?.content?.text;
 
+  response.observe(msg);
+
   if (
     msg.method === "session/update" &&
     typeof updateText === "string" &&
-    updateText.includes("Connection stalled")
+    /^(?:Error: )?Connection stalled(?:[.:]|$)/.test(updateText)
   ) {
     retryableStall = true;
   }
@@ -1051,25 +1222,33 @@ agent.on("exit", code => {
 });
 
 const timer = setInterval(() => {
-  redraw();
+  display.tick();
 }, 1000);
 
 const prompt = `
-Read TARGET.md if present and the current IMPLEMENTATION.md.
+Read TARGET.md and SESSION.md if present. The current IMPLEMENTATION.md follows verbatim; use this shared plan directly:
 
-Implement exactly the current implementation step.
+${fs.readFileSync("IMPLEMENTATION.md", "utf8")}
+
+${process.env.AUTOCYCLE_PROJECT_HISTORY}
+
+Implement exactly the current implementation step, including its admitted evidence_routes. Execute the listed existing checks or inspections and submit listed Office requests through Office Bridge. Record actual results for Review. Never define a stronger acceptance criterion, invent evidence requirements, execute unclassified work, or build AutoCycle verification infrastructure to satisfy this project.
+If partial work exists from a network interruption, inspect and preserve it, finish remaining work, and rerun required verification. A prior interruption is not completion evidence.
+Previously displayed completed tasks (retain their labels and inspect preserved work): ${JSON.stringify(display.state.completed)}.
 
 Before editing, create a concise todo list of 2-5 subtasks.
-Each todo label must be only 2-5 words.
+Each todo label must be only 2-5 words. On retry, retain the previous labels and completed work; add only remaining tasks.
 Keep todo statuses updated while working.
 
 Requirements:
 - Work only in this repository.
-- Run tests and verification required by IMPLEMENTATION.md.
-- A completed step may require no edits. Reverify acceptance, report measured results, and finish normally.
+- Follow the current IMPLEMENTATION.md and its parent Completion. Follow any explicit mandatory constraints or checks; optional guidance stays ordinary plan content.
+- Choose tests, inspections, probes or other reasonable verification that demonstrate progress toward or achievement of the parent Completion, unless Planner explicitly requires a particular check. Report the evidence actually produced and measured results. If explicit acceptance conditions are present, report their result; otherwise do not manufacture them. Your result does not authoritatively close the Step: opening Review independently judges Completion.
+- Use the plan's current Step x.y or Step x.y.z ID consistently in RESULT.md and your result; do not add another Session/Step numbering format.
+- A bounded attempt may require no edits. Reverify the relevant behavior against Completion, report measured results, and finish normally.
 - Do not make cosmetic edits solely to create a diff.
-- TARGET.md and IMPLEMENTATION.md are strictly read-only, even if the plan requests edits.
-- Record measured verification and completion in RESULT.md when needed.
+- TARGET.md, SESSION.md and IMPLEMENTATION.md are strictly read-only, even if the plan requests edits.
+- Record the commands/checks run and measured results in RESULT.md when needed and in the implementation result so the following Review can inspect the evidence.
 - Report required plan changes in RESULT.md; never rewrite the plan.
 - Do not create or switch branches.
 - Do not commit.
@@ -1077,7 +1256,20 @@ Requirements:
 - Do not run sync or checkpoint.
 - Do not begin the next implementation step.
 - Do not ask the user questions.
+- When verification requires native Microsoft Excel cached values on macOS, use the installed helper through your normal command tool before declaring Excel unavailable:
+  python3 "${require('node:path').join(require('node:path').dirname(process.argv[4]), 'excel_verification.py')}" SOURCE.xlsx -- EXISTING_VERIFIER_COMMAND '{workbook}'
+  Adapt the existing project cached-value verification command to accept the copy path in the literal {workbook} argument. Retain all required independent-reference comparisons, formula preservation and error checks; never replace them with command success or file hashes. The helper populates the fixed .git/autocycle/office/excel-verify.xlsx slot, recalculates/saves/closes only that slot in native Excel, invokes the verifier, and freezes an immutable saved-copy.xlsx under office/evidence/excel. Never open the frozen evidence directly in Excel. No manual Calculate Now is needed. Inspect its evidence JSON and verifier log. VERIFIED allows normal continuation; BLOCKED supplies the specific Action for RESULT.md and the existing blocker candidate. Never retry by manipulating unrelated Excel workbooks or dismissing dialogs.
 - If external input is genuinely required, stop instead of guessing.
+- End with IMPLEMENT_STATUS: COMPLETE only after this bounded attempt and reasonable verification finish successfully, including mandatory checks. This reports execution, not major Step closure; report remaining gaps toward Completion honestly.
+- If scope, missing evidence or required human input prevents completion, preserve correct partial work and evidence in RESULT.md, then return IMPLEMENT_STATUS: BLOCKED and BLOCKER: <concrete reason>. Do not mark unresolved todos completed.
+- When .autocycle.toml opts into native_office, use only the installed fixed slots for native Office. For Word native saved-state verification use python3 "${require('node:path').join(require('node:path').dirname(process.argv[4]), 'native_office.py')}" verify word SOURCE.docx EXISTING_VERIFIER '{document}'. Do not operate on user documents, historical randomized copies or immutable snapshots in Office. Native operations are serialized.
+- Observer is a shared component, not an acceptance authority. Reuse applicable authenticated observations when possible. Request observation only to diagnose or execute this admitted Plan; final semantic acceptance belongs to Reviewer. Do not inspect again solely to certify your own final acceptance.
+- To request a supported native capture or navigation, return only OBSERVER_REQUEST: {"requests":[{"app":"word","source":"relative/or/absolute.docx","source_sha256":"actual SHA-256"}]} (Excel additionally needs worksheet). Keep unfinished todos pending. Controller validates source, ownership, enabled applications and supported view operations, invokes Observer, and returns its authenticated result to this same Implement stage and work identity. After observing, continue the admitted Plan and report measured results. A failed observation is a technical execution result, not capability absence.
+- Do not write NATIVE_HANDOFF, cancel a todo as delegated, or end Implement because a capture is pending. Do not operate on user Office documents or take screenshots outside Observer.
+Authenticated observations available to this continuation (inspect the indexed files):
+${observerEvidence}
+- Do not expand file restrictions yourself; Review adjudicates and Plan alone revises the plan.
+- Never invent evidence or bypass explicit user constraints, TARGET.md, permissions or access controls.
 - Keep the final prose response extremely short; the todo display is the primary result.
 `;
 
@@ -1099,6 +1291,14 @@ function validateCompletion(result, items) {
   if (!items.some(item => item.status === "completed")) {
     throw new Error("Cursor cancelled every task; implementation unverified.");
   }
+}
+
+// Classify the terminal provider message before completion-marker validation.
+// Keep the allowlist narrow: ordinary markerless end_turn still fails closed.
+function providerRetriableError() {
+  const lastMessage = response.messages[response.messages.length - 1] || "";
+  return transportError(lastMessage) || /^\s*(?:Error: )?RetriableError: \[resource_exhausted\] Error\s*$/.test(lastMessage)
+    ? lastMessage.trim() : "";
 }
 
 async function main() {
@@ -1136,7 +1336,42 @@ async function main() {
     });
 
     log.write(`\n[result] stopReason=${result?.stopReason || "unknown"}\n`);
-    validateCompletion(result, todoOrder.map(id => todos.get(id)).filter(Boolean));
+    const providerError = providerRetriableError();
+    if (providerError) {
+      throw new Error("Provider RetriableError: " + providerError + ". Evidence preserved.");
+    }
+    const responseText = response.text();
+    if (/^OBSERVER_REQUEST:/m.test(responseText)) {
+      if (result?.stopReason !== "end_turn") throw new Error("Observer request requires a normal provider return");
+      shuttingDown = true;
+      agent.stdin.end();
+      try { process.kill(-agent.pid, "SIGTERM"); } catch {}
+      const stopped = await new Promise(resolve => {
+        if (agentClosed) return resolve(true);
+        const timeout = setTimeout(() => resolve(false), 5000);
+        agent.once("close", () => { clearTimeout(timeout); resolve(true); });
+      });
+      if (!stopped || git("rev-parse", "HEAD") !== beforeSha || git("branch", "--show-current") !== beforeBranch)
+        throw new Error("Observer continuation could not authenticate stopped provider ownership");
+      execFileSync("python3", [adjudicator, "observe-request", "Implement"], {input:responseText});
+      clearInterval(timer);
+      log.end(() => process.exit(77));
+      return;
+    }
+    if (/NATIVE_HANDOFF|Controller capture delegated/.test(responseText) ||
+        todoOrder.some(id => todos.get(id)?.content === 'Controller capture delegated'))
+      throw new Error("Legacy native delegation is not accepted for new work");
+    const statuses = [...responseText.matchAll(/^IMPLEMENT_STATUS: (COMPLETE|BLOCKED)\s*$/gm)];
+    if (result?.stopReason !== "end_turn" || statuses.length !== 1) {
+      throw new Error("Implementation response rejected: stopReason=" +
+        (result?.stopReason || "missing") + "; status markers=" + statuses.length +
+        ". Evidence preserved.");
+    }
+    const blocked = statuses[0][1] === "BLOCKED";
+    if (!blocked) validateCompletion(result, todoOrder.map(id => todos.get(id)).filter(Boolean));
+    if (blocked && !/^BLOCKER: \S.+/m.test(responseText)) {
+      throw new Error("Implementation blocker has no concrete reason.");
+    }
     if (git("branch", "--show-current") !== beforeBranch) {
       throw new Error("Cursor switched Git branches.");
     }
@@ -1154,6 +1389,18 @@ async function main() {
       log.write("\n[result] no_changes=true; normal completion accepted\n");
     }
 
+    if (blocked) {
+      clearInterval(timer);
+      shuttingDown = true;
+      agent.stdin.end();
+      agent.kill();
+      redraw(true);
+      if (process.env.AUTOCYCLE_CONTROLLER_REVIEW === '1') display.outcome('↪');
+      else display.finish('↪');
+      display.event("◇ Blocker candidate: " + (responseText.match(/BLOCKER: ([^\n]+)/)?.[1] || "implementation needs Review"));
+      log.end(() => process.exit(42));
+      return;
+    }
     finished = true;
 
     clearInterval(timer);
@@ -1179,24 +1426,31 @@ async function main() {
 
     try {
       agent.stdin.end();
-      agent.kill();
+      process.kill(-agent.pid, "SIGTERM");
     } catch {}
 
     const sameHead =
       git("rev-parse", "HEAD") === beforeSha;
 
-    const clean =
-      git("status", "--porcelain") === "";
+    // Wait for the ACP process and its inherited output streams to close before
+    // the shell fingerprints partial work. No receipt on uncertain shutdown.
+    const stopped = await new Promise(resolve => {
+      if (agentClosed) return resolve(true);
+      const timeout = setTimeout(() => resolve(false), 5000);
+      agent.once("close", () => { clearTimeout(timeout); resolve(true); });
+    });
+    const transportFailure = providerRetriableError();
 
     const safeToRetry =
-      retryableStall && sameHead && clean &&
+      (retryableStall || transportFailure) && stopped && sameHead &&
       git("branch", "--show-current") === beforeBranch;
 
-    log.end();
-
+    display.clearTimer();
     if (safeToRetry) {
-      process.stdout.write("\n");
+      if (transportFailure) display.event("Provider RetriableError: " + transportFailure);
+      redraw();
     } else {
+      display.finish('✗');
       process.stderr.write("\n");
       process.stderr.write(
         `✗ ${err?.message || String(err)}\n`
@@ -1204,7 +1458,8 @@ async function main() {
       process.stderr.write(`Log: ${logFile}\n`);
     }
 
-    process.exit(safeToRetry ? 75 : 1);
+    // Flush the recorded completion reason/error before exiting the Node process.
+    log.end(() => process.exit(safeToRetry ? (retryableStall || transportError(transportFailure) ? 75 : 79) : 1));
   }
 }
 
@@ -1214,17 +1469,42 @@ NODE
     EXIT_CODE=$?
     set -e
 
-    if [[ "$EXIT_CODE" -eq 75 ]]; then
+    if [[ "$EXIT_CODE" -eq 77 ]]; then exit 77; fi
+    if [[ "$EXIT_CODE" -eq 75 || "$EXIT_CODE" -eq 79 ]]; then
+        adjudication interruption "$CURSOR_LOG" || fail "cannot preserve transport interruption safely."
         if [[ "$ATTEMPT" -lt 3 ]]; then
-            echo "Implement connection stalled — retry $ATTEMPT/2"
-            sleep 2
+            if [[ "$EXIT_CODE" -eq 75 ]]; then
+                node "$(dirname "$ADJUDICATOR")/stage_display.js" "$AUTOCYCLE_DISPLAY_STATE" Implement network-start
+            else
+                node "$(dirname "$ADJUDICATOR")/stage_display.js" "$AUTOCYCLE_DISPLAY_STATE" Implement event "↻ Provider capacity retry $ATTEMPT/2"
+            fi
+            live_start Implement
+            sleep "$((ATTEMPT * 2))"
+            live_stop_timer
+            if [[ "$EXIT_CODE" -eq 75 ]]; then
+                node "$(dirname "$ADJUDICATOR")/stage_display.js" "$AUTOCYCLE_DISPLAY_STATE" Implement network-end "✓"
+            fi
             run_cursor "$((ATTEMPT + 1))"
             return
         fi
 
-        fail "implementation connection stalled after 3 attempts. Log: $CURSOR_LOG"
+        if [[ "$EXIT_CODE" -eq 75 ]]; then
+            node "$(dirname "$ADJUDICATOR")/stage_display.js" "$AUTOCYCLE_DISPLAY_STATE" Implement network-start
+            node "$(dirname "$ADJUDICATOR")/stage_display.js" "$AUTOCYCLE_DISPLAY_STATE" Implement network-end "✗" "retry exhausted"
+        fi
+        node "$(dirname "$ADJUDICATOR")/stage_display.js" "$AUTOCYCLE_DISPLAY_STATE" Implement finish "–"
+        echo "    – provider/network retry limit exhausted after 3 attempts; partial work saved. Run autocycle --resume when connectivity returns."
+        echo "Log: $CURSOR_LOG"
+        exit 76
     fi
 
+    if [[ "$EXIT_CODE" -eq 42 ]]; then
+        adjudication candidate implementation "$CURSOR_LOG" "${AUTOCYCLE_INPUT_BATCH:-}" || fail "cannot preserve blocker evidence."
+        printf 'HEAD: %s\nBRANCH: %s\nLOG: %s\nOUTCOME: BLOCKED_CANDIDATE\n' \
+            "$BEFORE_SHA" "$(git branch --show-current)" "$CURSOR_LOG" > "$LOG_DIR/latest-implementation.tmp.$$"
+        mv "$LOG_DIR/latest-implementation.tmp.$$" "$LOG_DIR/latest-implementation"
+        exit 42
+    fi
     if [[ "$EXIT_CODE" -ne 0 ]]; then
         fail "implementation. Log: $CURSOR_LOG"
     fi
@@ -1232,53 +1512,20 @@ NODE
     [[ "$(git rev-parse HEAD)" == "$BEFORE_SHA" ]] \
         || fail "implementation changed Git HEAD."
 
-    assert_owned_docs "$BEFORE_SHA"
+    if ! (assert_owned_docs "$BEFORE_SHA"); then
+        adjudication candidate checkpoint "$CURSOR_LOG" "${AUTOCYCLE_INPUT_BATCH:-}" || fail "cannot preserve ownership evidence."
+        exit 42
+    fi
+    adjudication implementation-result || fail "cannot freeze implementation work for checkpoint."
 
     # Save a pointer to this successful run's evidence, including no-change runs.
     local EVIDENCE_TMP="$LOG_DIR/latest-implementation.tmp.$$"
     printf 'HEAD: %s\nBRANCH: %s\nLOG: %s\n' \
         "$BEFORE_SHA" "$(git branch --show-current)" "$CURSOR_LOG" > "$EVIDENCE_TMP"
     mv "$EVIDENCE_TMP" "$LOG_DIR/latest-implementation"
-}
-
-# ============================================================
-# Checkpoint
-# ============================================================
-
-run_checkpoint() {
-    local OUTPUT
-    local BEFORE
-
-    BEFORE=$(git rev-parse HEAD)
-
-    assert_owned_docs "$BEFORE"
-    if [[ -z "$(git status --porcelain)" ]]; then
-        BRANCH=$(git branch --show-current)
-        git fetch origin "$BRANCH" >/dev/null 2>&1 || fail "could not verify no-change checkpoint."
-        [[ "$(git rev-parse "origin/$BRANCH")" == "$BEFORE" ]] || fail "no-change HEAD is not on GitHub."
-        CHECKPOINT_SHA="$BEFORE"
-        CHECKPOINT_SHORT="skipped (no changes)"
-        rm -f "$CACHE_FILE"
-        return 0
+    if [[ "${AUTOCYCLE_CONTROLLER_REVIEW:-}" != 1 ]]; then
+        node "$(dirname "$ADJUDICATOR")/stage_display.js" "$AUTOCYCLE_DISPLAY_STATE" Implement finish "✓"
     fi
-    if ! OUTPUT=$(checkpoint 2>&1); then
-        echo "$OUTPUT"
-        fail "checkpoint"
-    fi
-
-    CHECKPOINT_SHA=$(git rev-parse HEAD)
-    CHECKPOINT_SHORT=$(git rev-parse --short HEAD)
-
-    [[ "$CHECKPOINT_SHA" != "$BEFORE" ]] \
-        || fail "checkpoint created no commit."
-
-    BRANCH=$(git branch --show-current)
-
-    git fetch origin "$BRANCH" >/dev/null 2>&1 \
-        || fail "could not verify checkpoint."
-
-    [[ "$(git rev-parse "origin/$BRANCH")" == "$CHECKPOINT_SHA" ]] \
-        || fail "checkpoint is not on GitHub."
 }
 
 # ============================================================
@@ -1291,16 +1538,18 @@ if [[ "$MODE" == "--dry-run" ]]; then
         echo "Cycle       $CYCLE/$MAX_CYCLES"
         echo
         echo "Review      ✓ 00:41"
-        echo "    Found: Latest implementation is correct and the next bounded step is clear."
-        echo "Plan        ✓ 00:27"
-        echo "    Planned: Step 9M.3E — Next bounded implementation"
-        echo "Sync        ✓ abc1234"
-        echo "Implement   ✓ 04:37"
+        echo "    ✓ Found   Latest implementation is correct and the next bounded step is clear."
+        echo "    ✓ Pruned  0 files · 0 B"
+        echo "Plan        ✓ 00:28"
+        echo "    ✓ Planned Step 1.1 — Next bounded implementation"
+        echo "    ✓ Baseline abc1234"
+        echo "Implement   ✓ 04:36"
         echo "    ✓ Regressions"
         echo "    ✓ Validation"
         echo "    ✓ Integration"
         echo "    ✓ Benchmark"
-        echo "Checkpoint  ✓ e8a912f"
+        echo "    ✓ Checkpoint e8a912f"
+        echo "Cycle          05:45"
     done
 
     exit 0
@@ -1356,46 +1605,4 @@ if [[ "$MODE" == "--implement-only" ]]; then
 fi
 
 # ============================================================
-# Full autocycle
-# ============================================================
-
-for ((CYCLE=1; CYCLE<=MAX_CYCLES; CYCLE++)); do
-
-    refresh_state
-
-    echo
-    echo "Cycle       $CYCLE/$MAX_CYCLES"
-    echo
-
-    # Review
-    run_review
-
-    if [[ "$STATUS" == "DONE" ]]; then
-        echo "Review      ✓ DONE"
-        break
-    fi
-
-    if [[ "$STATUS" == "BLOCKED" ]]; then
-        echo "Review      ✗ BLOCKED"
-        echo
-        echo "$REVIEW_TEXT"
-        exit 2
-    fi
-
-    # Plan
-    run_plan
-    push_plan
-
-    # Sync
-    run_sync
-    echo "Sync        ✓"
-    echo
-
-    # Cursor
-    run_cursor
-    echo
-
-    # Checkpoint
-    run_checkpoint
-    echo "Checkpoint  ✓ $CHECKPOINT_SHORT"
-done
+# All recurring orchestration belongs to autocycle (Controller).

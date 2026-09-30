@@ -1,8 +1,10 @@
 #!/bin/bash
 set -euo pipefail
-# AUTOCYCLE_COMPACT_STAGES_V1
+# Ownership recovery binds the index bytes; read-only status must not refresh it.
+export GIT_OPTIONAL_LOCKS=0
+ORIGINAL_ARGS=("$@")
 
-# autocycle live instruction queue v1
+# Controller instruction entrypoints
 QUEUE_HELPER="$HOME/.autocycle/instructions.py"
 case "${1:-}" in
     --instruct|--instructions|--cancel-instruction)
@@ -10,22 +12,68 @@ case "${1:-}" in
         ;;
 esac
 
-# Keep the Mac awake for the lifetime of autocycle.
-# The display may still turn off.
-if [[ "${1:-}" != "--stop" && "$(uname -s)" == "Darwin" && "${AUTOCYCLE_CAFFEINATED:-0}" != "1" ]]; then
-    exec caffeinate -i -s env AUTOCYCLE_CAFFEINATED=1 "$0" "$@"
-fi
-
 ENGINE="$HOME/.autocycle/stage"
+ADJUDICATOR="$HOME/.autocycle/adjudication.py"
+export AUTOCYCLE_RUNTIME_DIR="$(dirname "$ADJUDICATOR")"
+adjudication() { python3 "$ADJUDICATOR" "$@"; }
+progress() { AUTOCYCLE_SESSION_NUMBER="${SESSION_NUMBER:-1}" python3 "$(dirname "$ADJUDICATOR")/progress.py" "$@"; }
+
+# Idempotent Git transport operations share the caller's active clock. FD 3
+# keeps display events outside captured command output (Baseline/Checkpoint).
+exec 3>&1
+autocycle_git() {
+    if [[ -z "${AUTOCYCLE_STAGE_LABEL:-}" || -z "${AUTOCYCLE_DISPLAY_STATE:-}" ]]; then
+        command git "$@"; return $?
+    fi
+    local LOG RC=0 ATTEMPT=0 INTERRUPTED=0 TIMER=""
+    local DISPLAY="$AUTOCYCLE_RUNTIME_DIR/stage_display.js"
+    LOG=$(mktemp "${AUTOCYCLE_DISPLAY_STATE}.git.XXXXXX")
+    while :; do
+        RC=0
+        command git "$@" > "$LOG" 2>&1 || RC=$?
+        if [[ "$RC" == 0 ]]; then
+            if [[ "$INTERRUPTED" == 1 ]]; then
+                node "$DISPLAY" "$AUTOCYCLE_DISPLAY_STATE" "$AUTOCYCLE_STAGE_LABEL" network-end "✓" >&3
+            fi
+            cat "$LOG"; rm -f "$LOG"; return 0
+        fi
+        if ! node "$AUTOCYCLE_RUNTIME_DIR/implementation_response.js" --transport "$LOG"; then
+            if [[ "$INTERRUPTED" == 1 ]]; then
+                node "$DISPLAY" "$AUTOCYCLE_DISPLAY_STATE" "$AUTOCYCLE_STAGE_LABEL" network-end "✓" >&3
+            fi
+            cat "$LOG"; rm -f "$LOG"; return "$RC"
+        fi
+        if [[ "$INTERRUPTED" == 0 ]]; then
+            node "$DISPLAY" "$AUTOCYCLE_DISPLAY_STATE" "$AUTOCYCLE_STAGE_LABEL" network-start >&3
+            INTERRUPTED=1
+        fi
+        ATTEMPT=$((ATTEMPT + 1))
+        if (( ATTEMPT >= 3 )); then
+            node "$DISPLAY" "$AUTOCYCLE_DISPLAY_STATE" "$AUTOCYCLE_STAGE_LABEL" network-end "✗" "retry exhausted" >&3
+            node "$DISPLAY" "$AUTOCYCLE_DISPLAY_STATE" "$AUTOCYCLE_STAGE_LABEL" finish "–" >&3
+            cat "$LOG"; rm -f "$LOG"; return 76
+        fi
+        if [[ -t 3 ]]; then
+            node "$DISPLAY" "$AUTOCYCLE_DISPLAY_STATE" "$AUTOCYCLE_STAGE_LABEL" live >&3 &
+            TIMER=$!
+        fi
+        sleep "$((ATTEMPT * 2))"
+        if [[ -n "$TIMER" ]]; then kill "$TIMER" 2>/dev/null || true; wait "$TIMER" 2>/dev/null || true; TIMER=""; fi
+    done
+}
+export -f autocycle_git
 
 usage() {
     echo "Usage:"
-    echo "  autocycle <cycles>"
+    echo "  autocycle <cycles> [--instruct 'text']"
+    echo "  autocycle <cycles> --restart [--instruct 'text']"
+    echo "  autocycle --resume   # continue the saved run and cycle budget"
     echo "  autocycle <cycles> --dry-run"
+    echo "  autocycle --extend <additional-cycles>"
     echo "  autocycle --review-only"
     echo "  autocycle --plan-only"
     echo "  autocycle --implement-only"
-    echo "  autocycle --stop    # pause after the current stage"
+    echo "  autocycle --stop    # pause after the current cycle checkpoint"
     echo '  autocycle --instruct "text"'
     echo "  autocycle --instructions"
     echo "  autocycle --cancel-instruction <id>"
@@ -33,6 +81,11 @@ usage() {
 }
 
 fail() {
+    if [[ -n "${ACTIVE_LABEL:-}" ]] && declare -F controller_stage_finish >/dev/null; then
+        if declare -F review_prune_finish >/dev/null; then review_prune_finish; fi
+        node "$(dirname "$ADJUDICATOR")/stage_display.js" "$DISPLAY_STATE" "$ACTIVE_LABEL" outcome "✗"
+        controller_stage_finish
+    fi
     echo
     echo "FAILED: $1"
     exit 1
@@ -42,8 +95,8 @@ fail() {
 # Network / VPN recovery
 # ============================================================
 
-VPN_SERVICE="${AUTOCYCLE_VPN_SERVICE:-VPN cat}"
-VPN_BUNDLE_ID="${AUTOCYCLE_VPN_BUNDLE_ID:-com.vpn.cat}"
+VPN_SERVICE="${AUTOCYCLE_VPN_SERVICE:-Surfshark. WireGuard®}"
+VPN_BUNDLE_ID="${AUTOCYCLE_VPN_BUNDLE_ID:-com.surfshark.vpnclient.macos}"
 NETWORK_TIMEOUT="${AUTOCYCLE_NETWORK_TIMEOUT:-600}"
 
 country_allowed() {
@@ -257,36 +310,255 @@ network_recover() {
     done
 }
 
+network_wait() {
+    local RC=0
+    if [[ -n "${ACTIVE_LABEL:-}" ]]; then
+        controller_refresh_stop
+        node "$(dirname "$ADJUDICATOR")/stage_display.js" "$DISPLAY_STATE" "$ACTIVE_LABEL" network-start
+        controller_refresh_start
+        network_recover > "$AC_DIR/network-recovery.log" 2>&1 || RC=$?
+        controller_refresh_stop
+        if [[ "$RC" == 0 ]]; then
+            node "$(dirname "$ADJUDICATOR")/stage_display.js" "$DISPLAY_STATE" "$ACTIVE_LABEL" network-end "✓"
+        else
+            node "$(dirname "$ADJUDICATOR")/stage_display.js" "$DISPLAY_STATE" "$ACTIVE_LABEL" network-end "✗" "retry exhausted"
+        fi
+    else
+        local PATH_STATE TIMER=""
+        PATH_STATE=$(mktemp "$AC_DIR/network-display.XXXXXX")
+        node "$(dirname "$ADJUDICATOR")/stage_display.js" "$PATH_STATE" Network clock >/dev/null
+        printf '\n'
+        if [[ -t 1 ]]; then
+            node "$(dirname "$ADJUDICATOR")/stage_display.js" "$PATH_STATE" Network live &
+            TIMER=$!
+        fi
+        network_recover > "$AC_DIR/network-recovery.log" 2>&1 || RC=$?
+        if [[ -n "$TIMER" ]]; then stop_display_timer "$TIMER"; fi
+        if [[ "$RC" == 0 ]]; then
+            node "$(dirname "$ADJUDICATOR")/stage_display.js" "$PATH_STATE" Network finish "✓"
+        else
+            node "$(dirname "$ADJUDICATOR")/stage_display.js" "$PATH_STATE" Network finish "✗" "retry exhausted"
+        fi
+        printf '\n'
+    fi
+    return "$RC"
+}
+
 ensure_network() {
     if network_ready; then
         return 0
     fi
 
-    network_recover
+    network_wait
+}
+
+stop_display_timer() {
+    local TIMER_PID="$1" TRY
+    # Wait for the renderer's signal handler before stopping a short stage.
+    # This prevents shell job notifications from displacing cursor anchors.
+    for ((TRY=0; TRY<50; TRY++)); do
+        kill -0 "$TIMER_PID" 2>/dev/null || break
+        [[ ! -f "${DISPLAY_STATE:-}.renderer-$TIMER_PID" ]] || break
+        sleep 0.02
+    done
+    kill "$TIMER_PID" 2>/dev/null || true
+    for TRY in 1 2 3 4 5; do
+        kill -0 "$TIMER_PID" 2>/dev/null || break
+        sleep 0.02
+    done
+    kill -KILL "$TIMER_PID" 2>/dev/null || true
+    wait "$TIMER_PID" 2>/dev/null || true
+} 2>/dev/null
+
+# Clock identity and accounting are Controller-owned. Renderer lifetimes are
+# disposable and never reset the active segment or accumulated duration.
+controller_stage() {
+    local LABEL="$1"
+    if [[ "${ACTIVE_LABEL:-}" == "$LABEL" ]]; then return; fi
+    controller_stage_finish
+    DISPLAY_STATE=$(mktemp "$AC_DIR/stage-display.XXXXXX")
+    ACTIVE_LABEL="$LABEL"
+    export AUTOCYCLE_DISPLAY_STATE="$DISPLAY_STATE" AUTOCYCLE_STAGE_LABEL="$LABEL"
+    case "$LABEL" in
+        Review) DISPLAY_MODE=--review-only ;;
+        Plan) DISPLAY_MODE=--plan-only ;;
+        Implement) DISPLAY_MODE=--implement-only ;;
+    esac
+    node "$(dirname "$ADJUDICATOR")/stage_display.js" "$DISPLAY_STATE" "$LABEL" clock >/dev/null
+}
+
+controller_refresh_start() {
+    if [[ -t 1 && -n "${ACTIVE_LABEL:-}" && -z "${DISPLAY_REFRESH_PID:-}" ]]; then
+        node "$(dirname "$ADJUDICATOR")/stage_display.js" "$DISPLAY_STATE" "$ACTIVE_LABEL" live &
+        DISPLAY_REFRESH_PID=$!
+    fi
+}
+
+controller_refresh_stop() {
+    if [[ -n "${DISPLAY_REFRESH_PID:-}" ]]; then
+        stop_display_timer "$DISPLAY_REFRESH_PID"
+        DISPLAY_REFRESH_PID=""
+    fi
+}
+
+controller_stage_finish() {
+    [[ -n "${ACTIVE_LABEL:-}" ]] || return 0
+    controller_refresh_stop
+    node "$(dirname "$ADJUDICATOR")/stage_display.js" "$DISPLAY_STATE" "$ACTIVE_LABEL" close
+    local ACTIVE_MS
+    ACTIVE_MS=$(node "$(dirname "$ADJUDICATOR")/stage_display.js" "$DISPLAY_STATE" "$ACTIVE_LABEL" active-ms)
+    if [[ "$ACTIVE_LABEL" != Access ]]; then
+        CYCLE_SECONDS=$((${CYCLE_SECONDS:-0} + ACTIVE_MS / 1000))
+        CYCLE_ENTERED=1
+    fi
+    ACTIVE_LABEL=""
+    unset AUTOCYCLE_STAGE_LABEL AUTOCYCLE_DISPLAY_STATE
+    DISPLAY_MODE=""
+}
+
+cycle_finish() {
+    review_prune_finish
+    controller_stage_finish
+    if [[ "${CYCLE_ENTERED:-0}" == 1 ]]; then
+        printf 'Cycle          %02d:%02d\n' "$((${CYCLE_SECONDS:-0} / 60))" "$((${CYCLE_SECONDS:-0} % 60))"
+    fi
+    CYCLE_SECONDS=0; CYCLE_ENTERED=0
+}
+
+review_clock_begin() {
+    controller_stage Review
+}
+
+observer_continue() {
+    local CALL IDS APP STATE CALLER
+    CALL=$(adjudication observe-call) || return 1
+    CALLER=$(printf '%s' "$CALL" | python3 -c 'import json,sys;print(json.load(sys.stdin)["snapshot"]["caller"])')
+    [[ "$CALLER" == "$ACTIVE_LABEL" ]] || return 1
+    STATE=$(printf '%s' "$CALL" | python3 -c 'import json,sys;print(json.load(sys.stdin)["state"])')
+    [[ "$STATE" != returned ]] || return 0
+    IDS=$(printf '%s' "$CALL" | python3 -c 'import json,sys;print(json.dumps([r["id"] for r in json.load(sys.stdin)["requests"]]))')
+    while IFS= read -r APP; do
+        node "$(dirname "$ADJUDICATOR")/stage_display.js" "$DISPLAY_STATE" "$ACTIVE_LABEL" observe "$APP" "▶"
+    done < <(printf '%s' "$CALL" | python3 -c 'import json,sys;print("\n".join(dict.fromkeys(r["app"].title() for r in json.load(sys.stdin)["requests"])))')
+    controller_refresh_start
+    python3 "$OFFICE_HELPER" process "$IDS" || { controller_refresh_stop; return 1; }
+    controller_refresh_stop
+    adjudication observe-result || return 1
+    CALL=$(adjudication observe-call) || return 1
+    while IFS= read -r APP; do
+        local SYMBOL="${APP%% *}"
+        node "$(dirname "$ADJUDICATOR")/stage_display.js" "$DISPLAY_STATE" "$ACTIVE_LABEL" observe "${APP#* }" "$SYMBOL"
+    done < <(printf '%s' "$CALL" | python3 -c 'import json,sys;rows=json.load(sys.stdin)["requests"];print("\n".join(("✓" if all(r["status"]=="CAPTURED" for r in rows if r["app"]==app) else "✗")+" "+app.title() for app in dict.fromkeys(r["app"] for r in rows)))')
 }
 
 run_engine_stage() {
     local MODE="$1"
     local ALLOW_DIRTY="${2:-0}"
     local RC
+    review_prune_finish
+    # Start the owning phase before Controller/Office preparation.
+    if [[ "$MODE" == --review-only ]]; then
+        review_clock_begin
+        controller_refresh_start
+        if [[ -n "${OFFICE_APPS:-}" ]]; then
+            local PREP_RC=0
+            if [[ -f "$AC_DIR/native-handoff.json" ]]; then
+                python3 "$OFFICE_HELPER" process || PREP_RC=$?
+            fi
+            if [[ "$PREP_RC" != 0 ]]; then controller_refresh_stop; return "$PREP_RC"; fi
+        fi
+        controller_refresh_stop
+    else
+        local LABEL=Plan
+        [[ "$MODE" != --implement-only ]] || LABEL=Implement
+        controller_stage "$LABEL"
+    fi
 
-    if AUTOCYCLE_INPUT_BATCH="${INPUT_CYCLE_ID:-}" AUTOCYCLE_INPUT_KEY="${INPUT_KEY:-}" \
+    if [[ -f "$AC_DIR/observer-call.json" ]]; then
+        observer_continue || return 1
+        if [[ "$MODE" == --review-only ]]; then adjudication observe-consume Review || return 1; fi
+    fi
+
+    local PLAN_RESULT=""
+    if [[ "$MODE" == --plan-only ]]; then PLAN_RESULT="$AC_DIR/planned-commit"; rm -f "$PLAN_RESULT"; fi
+    if AUTOCYCLE_PLAN_RESULT="$PLAN_RESULT" AUTOCYCLE_CONTROLLER_REVIEW=1 AUTOCYCLE_DISPLAY_STATE="$DISPLAY_STATE" AUTOCYCLE_REVIEW_CYCLE="$RUN_CYCLE" AUTOCYCLE_INPUT_BATCH="${INPUT_CYCLE_ID:-}" AUTOCYCLE_INPUT_KEY="${INPUT_KEY:-}" \
        AUTOCYCLE_ALLOW_DIRTY="$ALLOW_DIRTY" "$ENGINE" "$MODE"; then
         RC=0
     else
         RC=$?
     fi
 
-    if [[ "$RC" -eq 0 ]]; then
-        return 0
+    if [[ "$RC" == 77 ]]; then
+        observer_continue || return 1
+        run_engine_stage "$MODE" "$ALLOW_DIRTY"
+        return $?
     fi
 
-    # Retry automatically only when connectivity is actually broken.
-    if ! network_ready; then
-        network_recover || return "$RC"
+    if [[ "$RC" -eq 78 ]]; then
+        return 78  # Capability absence is terminal, never a network retry.
+    fi
+    if [[ "$RC" -eq 76 ]]; then
+        # Provider transport retries are exhausted; retain the saved resume receipt.
+        return "$RC"
+    fi
 
-        # Signal the durable state machine to retry this same boundary.
-        return 75
+    if [[ "$RC" -eq 0 || "$RC" -eq 42 ]]; then
+        NETWORK_RETRIES=0
+        if [[ "$MODE" == --plan-only && "$RC" == 0 ]]; then
+            local PUBLISHED_BRANCH
+            read -r PUBLISHED_PLAN_SHA PUBLISHED_BRANCH < "$PLAN_RESULT" || return 1
+            [[ "$PUBLISHED_PLAN_SHA" =~ ^[0-9a-f]{40}$ && "$PUBLISHED_BRANCH" == "$(branch)" ]] || return 1
+        fi
+        if [[ "$MODE" == --review-only ]]; then
+            REVIEW_DISPLAY_STATE="$DISPLAY_STATE"
+            node "$(dirname "$ADJUDICATOR")/stage_display.js" "$DISPLAY_STATE" Review outcome "✓"
+            REVIEW_FINDING=$(sed -n 's/^REVIEW: //p' "$CACHE" | tail -n 1)
+            if grep -qx 'REVIEW_STATUS: BLOCKED' "$CACHE"; then
+                REVIEW_FINDING="Blocked: $REVIEW_FINDING; Action: $(sed -n 's/^HUMAN_ACTION: //p' "$CACHE")"
+            fi
+            node "$(dirname "$ADJUDICATOR")/stage_display.js" "$REVIEW_DISPLAY_STATE" Review event "✓ Found   $REVIEW_FINDING"
+            controller_refresh_start
+            REVIEW_PRUNE_FILES=0; REVIEW_PRUNE_BYTES=0
+            REVIEW_PRUNE_STARTED=0; REVIEW_PRUNE_CLOSED=0
+            REVIEW_PRUNE_SYMBOL="✓"; REVIEW_PRUNE_ERROR=""
+        fi
+        return "$RC"
+    fi
+
+    # Only a failed provider call is eligible here. Validation, capability,
+    # ownership and Office errors never become Network because a probe is down.
+    if [[ "$RC" == 74 ]]; then
+        local LABEL=Review
+        [[ "$MODE" != --plan-only ]] || LABEL=Plan
+        NETWORK_RETRIES=$((${NETWORK_RETRIES:-0} + 1))
+        save_state
+        node "$(dirname "$ADJUDICATOR")/stage_display.js" "$DISPLAY_STATE" "$LABEL" network-start
+        if (( NETWORK_RETRIES > 3 )); then
+            node "$(dirname "$ADJUDICATOR")/stage_display.js" "$DISPLAY_STATE" "$LABEL" network-end "✗" "retry exhausted"
+            node "$(dirname "$ADJUDICATOR")/stage_display.js" "$DISPLAY_STATE" "$LABEL" finish "–"
+            return 76
+        fi
+        local RECOVERY_RC=0 NETWORK_TIMER=""
+        if [[ -t 1 ]]; then
+            node "$(dirname "$ADJUDICATOR")/stage_display.js" "$DISPLAY_STATE" "$LABEL" live &
+            NETWORK_TIMER=$!
+        fi
+        if network_ready; then
+            sleep "$((NETWORK_RETRIES * 2))"
+        else
+            network_recover > "$AC_DIR/network-recovery.log" 2>&1 || RECOVERY_RC=$?
+        fi
+        if [[ -n "$NETWORK_TIMER" ]]; then stop_display_timer "$NETWORK_TIMER"; fi
+        if [[ "$RECOVERY_RC" != 0 ]]; then
+            node "$(dirname "$ADJUDICATOR")/stage_display.js" "$DISPLAY_STATE" "$LABEL" network-end "✗" "retry exhausted"
+            node "$(dirname "$ADJUDICATOR")/stage_display.js" "$DISPLAY_STATE" "$LABEL" finish "–"
+            return 76
+        fi
+        node "$(dirname "$ADJUDICATOR")/stage_display.js" "$DISPLAY_STATE" "$LABEL" network-end "✓"
+        # Retry inside this logical stage. Routing through saved-state
+        # recovery would re-enter Review before an interrupted Plan.
+        run_engine_stage "$MODE" "$ALLOW_DIRTY"
+        return $?
     fi
 
     return "$RC"
@@ -296,23 +568,27 @@ run_engine_stage() {
 
 MODE="run"
 MAX_CYCLES=1
+NEW_INSTRUCTION=""
 
-if [[ $# -eq 1 ]]; then
-    if [[ "$1" =~ ^[1-9][0-9]*$ ]]; then
-        MAX_CYCLES="$1"
-    else
-        MODE="$1"
-    fi
-elif [[ $# -eq 2 ]]; then
-    [[ "$1" =~ ^[1-9][0-9]*$ ]] || usage
-    MAX_CYCLES="$1"
-    MODE="$2"
+if [[ "${1:-}" =~ ^[1-9][0-9]*$ ]]; then
+    MAX_CYCLES="$1"; shift
+    if (( $# > 0 )) && [[ "$1" != --instruct ]]; then MODE="$1"; shift; fi
+    [[ "$MODE" != --resume && "$MODE" != --extend ]] || usage
+elif (( $# > 0 )); then
+    MODE="$1"; shift
 else
     usage
 fi
-
+if [[ "$MODE" == --extend ]]; then
+    [[ $# == 1 && "$1" =~ ^[1-9][0-9]*$ ]] || usage
+    MAX_CYCLES="$1"; shift
+elif [[ ( "$MODE" == run || "$MODE" == --restart ) && $# != 0 ]]; then
+    [[ $# == 2 && "$1" == --instruct && -n "$2" ]] || usage
+    NEW_INSTRUCTION="$2"; shift 2
+fi
+[[ $# == 0 ]] || usage
 case "$MODE" in
-    run|--dry-run|--review-only|--plan-only|--implement-only|--stop) ;;
+    run|--restart|--resume|--extend|--dry-run|--review-only|--plan-only|--implement-only|--stop) ;;
     *) usage ;;
 esac
 
@@ -335,26 +611,69 @@ STOP_REQUEST="$AC_DIR/stop-request"
 if [[ "$MODE" == "--stop" ]]; then
     # mkdir is an atomic, idempotent request; no network or signals required.
     mkdir -p "$STOP_REQUEST"
-    echo "Stop requested. Autocycle will pause after its current stage saves state."
+    echo "Stop requested. Autocycle will pause after its current cycle checkpoint and bookkeeping finish."
     exit 0
 fi
 
 pause_if_requested() {
+    # A normal cycle must reach its checkpoint before consuming a stop request.
+    # Manual single-stage commands retain their explicit single-stage boundary.
+    if [[ "${MODE:-run}" != --review-only && "${MODE:-run}" != --plan-only && "${MODE:-run}" != --implement-only && "${STAGE:-}" != checkpoint_done ]]; then
+        return 0
+    fi
     if [[ -d "$STOP_REQUEST" ]]; then
         rmdir "$STOP_REQUEST" || fail "could not consume stop request."
         echo
         echo "Paused. Saved state and working files preserved."
-        echo "Resume by rerunning your original autocycle command."
+        echo "Resume with autocycle --resume."
         exit 0
     fi
 }
 
+
+# Project configuration alone opts into Office. Queue/admin paths never probe.
+OFFICE_HELPER="$(dirname "$ADJUDICATOR")/native_office.py"
+OFFICE_APPS=""
+case "$MODE" in
+    run|--resume|--restart|--extend)
+        OFFICE_APPS=$(python3 "$OFFICE_HELPER" capabilities) || fail "invalid project Office capabilities."
+        ;;
+esac
+# Preserve the existing non-Office power behavior.
+if [[ -z "$OFFICE_APPS" && "$(uname -s)" == Darwin && "${AUTOCYCLE_CAFFEINATED:-0}" != 1 ]]; then
+    exec caffeinate -i -s env AUTOCYCLE_CAFFEINATED=1 "$0" "${ORIGINAL_ARGS[@]}"
+fi
 
 # The descriptor stays open in the controller and its children. A competing
 # controller fails immediately; instruction submission uses only SQLite locks.
 if [[ "$MODE" != "--dry-run" ]]; then
     exec 9>"$AC_DIR/controller.lock"
     python3 "$QUEUE_HELPER" lock 9 || fail "another controller is running or its lock is unavailable."
+fi
+
+# -w binds the assertion to this controller even after a hard kill. The trap
+# releases it promptly on normal exit/signals. No persistent power settings.
+if [[ -n "$OFFICE_APPS" ]]; then
+    [[ "$(uname -s)" == Darwin ]] || fail "native Office requires macOS."
+    caffeinate -d -i -w "$$" >/dev/null 2>&1 &
+    OFFICE_POWER_PID=$!
+    trap 'kill "$OFFICE_POWER_PID" 2>/dev/null || true; wait "$OFFICE_POWER_PID" 2>/dev/null || true' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    trap 'exit 129' HUP
+    python3 "$OFFICE_HELPER" power-check "$OFFICE_POWER_PID" || fail "native Office power assertion unavailable."
+    controller_stage Access
+    controller_refresh_start
+    ACCESS_RC=0
+    AUTOCYCLE_ACCESS_QUIET=1 python3 "$OFFICE_HELPER" preflight > "$AC_DIR/access.log" 2>&1 || ACCESS_RC=$?
+    controller_refresh_stop
+    if [[ "$ACCESS_RC" == 0 ]]; then
+        node "$(dirname "$ADJUDICATOR")/stage_display.js" "$DISPLAY_STATE" Access outcome "✓"
+    else
+        node "$(dirname "$ADJUDICATOR")/stage_display.js" "$DISPLAY_STATE" Access outcome "✗" "$(sed -n 's/^Access *✗ [0-9:]*  //p' "$AC_DIR/access.log")"
+    fi
+    controller_stage_finish
+    [[ "$ACCESS_RC" == 0 ]] || exit "$ACCESS_RC"
 fi
 
 input_queue() {
@@ -372,10 +691,12 @@ prepare_cycle_input() {
     if (( INPUT_COUNT > 0 )); then
         INPUT_KEY="$INPUT_CYCLE_ID"
         if [[ "${INPUT_PRINTED:-}" != "$INPUT_CYCLE_ID" ]]; then
-            if [[ "$INPUT_COUNT" == 1 ]]; then
+            local NEW_INPUT_COUNT
+            NEW_INPUT_COUNT=$(input_queue notice "$INPUT_CYCLE_ID") || fail "could not record instruction delivery notice."
+            if [[ "$NEW_INPUT_COUNT" == 1 ]]; then
                 echo "Input       ✓ 1 instruction"
-            else
-                echo "Input       ✓ $INPUT_COUNT instructions"
+            elif (( NEW_INPUT_COUNT > 1 )); then
+                echo "Input       ✓ $NEW_INPUT_COUNT instructions"
             fi
             INPUT_PRINTED="$INPUT_CYCLE_ID"
         fi
@@ -394,12 +715,76 @@ STATE_BRANCH=""
 INPUT_CYCLE_ID=""
 INPUT_ALLOW_NEW=0
 INPUT_KEY=""
+CANDIDATE_RESOLVED=0
+NETWORK_RETRIES=0
+NEXT_INPUT_ID=""
+CHECKPOINT_UNSAFE=0
+BOUNDARY_KIND=checkpoint
+SESSION_NEW=0
+SESSION_NUMBER=1
+
+# Presentation counters use the existing GC report, never another artifact scan.
+review_prune_begin() {
+    [[ -n "${REVIEW_DISPLAY_STATE:-}" && "${REVIEW_PRUNE_CLOSED:-0}" != 1 ]] || return 0
+    if [[ -t 1 && "${REVIEW_PRUNE_STARTED:-0}" != 1 ]]; then
+        node "$(dirname "$ADJUDICATOR")/stage_display.js" "$REVIEW_DISPLAY_STATE" Review prune "▶" "checking retention"
+    fi
+    REVIEW_PRUNE_STARTED=1
+}
+
+review_prune_finish() {
+    [[ -n "${REVIEW_DISPLAY_STATE:-}" && "${REVIEW_PRUNE_CLOSED:-0}" != 1 ]] || return 0
+    controller_refresh_stop
+    node "$(dirname "$ADJUDICATOR")/stage_display.js" "$REVIEW_DISPLAY_STATE" Review prune "${REVIEW_PRUNE_SYMBOL:-✓}" "${REVIEW_PRUNE_FILES:-0} files · ${REVIEW_PRUNE_BYTES:-0} B${REVIEW_PRUNE_ERROR:-}"
+    REVIEW_PRUNE_CLOSED=1
+}
+
+boundary_begin() {
+    case "$1" in
+        Baseline) controller_stage Plan ;;
+        Checkpoint) controller_stage Implement ;;
+        *) controller_stage "$1" ;;
+    esac
+    controller_refresh_start
+}
+
+boundary_done() {
+    local LABEL="$1" SYMBOL="$2" DETAIL="${3:-}"
+    case "$LABEL" in
+        Baseline) controller_stage Plan; LABEL=Baseline ;;
+        Checkpoint) controller_stage Implement ;;
+        *) controller_stage "$LABEL" ;;
+    esac
+    controller_refresh_stop
+    node "$(dirname "$ADJUDICATOR")/stage_display.js" "$DISPLAY_STATE" "$ACTIVE_LABEL" event "$SYMBOL $LABEL${DETAIL:+ $DETAIL}"
+}
+
+controller_cleanup() {
+    local STATUS=$?
+    controller_refresh_stop
+    if [[ -n "${ACTIVE_LABEL:-}" && "$STATUS" != 0 ]]; then
+        node "$(dirname "$ADJUDICATOR")/stage_display.js" "$DISPLAY_STATE" "$ACTIVE_LABEL" interrupted >/dev/null
+    fi
+    cycle_finish
+    if [[ -n "${OFFICE_POWER_PID:-}" ]]; then
+        kill "$OFFICE_POWER_PID" 2>/dev/null || true
+        wait "$OFFICE_POWER_PID" 2>/dev/null || true
+    fi
+}
+trap controller_cleanup EXIT
 
 save_state() {
     local TMP="$STATE.tmp.$$"
 
     {
-        printf 'STATE_VERSION=%q\n' "1"
+        printf 'STATE_VERSION=%q\n' "2"
+        printf 'SESSION_NUMBER=%q\n' "$SESSION_NUMBER"
+        printf 'SESSION_NEW=%q\n' "${SESSION_NEW:-0}"
+        printf 'BOUNDARY_KIND=%q\n' "${BOUNDARY_KIND:-checkpoint}"
+        printf 'NEXT_INPUT_ID=%q\n' "${NEXT_INPUT_ID:-}"
+        printf 'CHECKPOINT_UNSAFE=%q\n' "${CHECKPOINT_UNSAFE:-0}"
+        printf 'NETWORK_RETRIES=%q\n' "${NETWORK_RETRIES:-0}"
+        printf 'CANDIDATE_RESOLVED=%q\n' "${CANDIDATE_RESOLVED:-0}"
         printf 'RUN_MAX=%q\n' "$RUN_MAX"
         printf 'RUN_CYCLE=%q\n' "$RUN_CYCLE"
         printf 'STAGE=%q\n' "$STAGE"
@@ -410,16 +795,38 @@ save_state() {
         printf 'INPUT_ALLOW_NEW=%q\n' "${INPUT_ALLOW_NEW:-0}"
     } > "$TMP"
 
-    mv "$TMP" "$STATE"
+    python3 - "$TMP" "$STATE" <<'DURABLE_PY' || return $?
+import os,sys
+with open(sys.argv[1],'rb') as f:os.fsync(f.fileno())
+os.replace(sys.argv[1],sys.argv[2])
+fd=os.open(os.path.dirname(sys.argv[2]),os.O_RDONLY)
+try:os.fsync(fd)
+finally:os.close(fd)
+DURABLE_PY
+    # The existing controller lock is inherited by this bounded GC transaction.
+    # Admission and the fsynced state above are both required; failures retain evidence.
+    if [[ "$STAGE" == review_done || "$STAGE" == session_complete ]]; then review_prune_begin; fi
+    if [[ "$STAGE" == review_done || "$STAGE" == session_complete ]] && [[ -d "$AC_DIR/office/evidence" ]]; then
+        if python3 "$OFFICE_HELPER" gc --controller-fd 9 > "$AC_DIR/office/gc-last-report.json" 2> "$AC_DIR/office/gc-last-error.log"; then
+            local GC_FILES GC_BYTES
+            read -r GC_FILES GC_BYTES < <(python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); print(r["deleted_files"],r["deleted_bytes"])' "$AC_DIR/office/gc-last-report.json")
+            REVIEW_PRUNE_FILES=$((${REVIEW_PRUNE_FILES:-0} + GC_FILES))
+            REVIEW_PRUNE_BYTES=$((${REVIEW_PRUNE_BYTES:-0} + GC_BYTES))
+        else
+            REVIEW_PRUNE_SYMBOL="✗"
+            REVIEW_PRUNE_ERROR=" · incomplete; see office/gc-last-error.log"
+        fi
+    fi
 }
 
 load_state() {
     [[ -f "$STATE" ]] || return 1
 
     # shellcheck disable=SC1090
+    python3 "$HOME/.autocycle/migration.py" "$STATE" || fail "state migration failed; original preserved."
     source "$STATE"
 
-    [[ "${STATE_VERSION:-}" == "1" ]]
+    [[ "${STATE_VERSION:-}" == "2" ]]
 }
 
 clear_state() {
@@ -436,6 +843,7 @@ branch() {
 # ownership guard v1
 assert_owned_docs() {
     local OWNERSHIP_BASE="${1:-HEAD}"
+    OWNERSHIP_BASE=$(adjudication docs-baseline "$OWNERSHIP_BASE") || fail "remote document ownership receipt is invalid; evidence preserved."
     if ! python3 - "$OWNERSHIP_BASE" <<'OWNERSHIP_PY'
 import os, stat, subprocess, sys
 from pathlib import Path
@@ -445,7 +853,7 @@ def git(*args):
 try:
     baseline = git('rev-parse', '--verify', sys.argv[1] + '^{commit}').strip().decode()
     root = Path(os.fsdecode(git('rev-parse', '--show-toplevel').rstrip(b'\n')))
-    for name in ('TARGET.md', 'IMPLEMENTATION.md'):
+    for name in ('TARGET.md', 'SESSION.md', 'IMPLEMENTATION.md'):
         tree = git('ls-tree', '-z', baseline, '--', name)
         index = git('ls-files', '--stage', '-z', '--', name)
         path = root / name
@@ -488,26 +896,7 @@ dirty() {
 }
 
 fetch_remote() {
-    local RC
-
-    set +e
-    git fetch --prune origin >/dev/null 2>&1
-    RC=$?
-    set -e
-
-    if [[ "$RC" -eq 0 ]]; then
-        return 0
-    fi
-
-    if ! network_ready; then
-        network_recover             || fail "network recovery failed while fetching origin."
-
-        git fetch --prune origin >/dev/null 2>&1             || fail "could not fetch origin after network recovery."
-
-        return 0
-    fi
-
-    fail "could not fetch origin."
+    autocycle_git fetch --prune origin >/dev/null 2>&1 || fail "could not fetch origin."
 }
 
 remote_sha() {
@@ -529,143 +918,16 @@ remote_plan_child_of_head() {
     S=$(git log -1 --pretty=%s "$R" 2>/dev/null || true)
 
     [[ "$P" == "$(head_sha)" && "$S" == "Plan: "* ]] || return 1
+    if git diff --name-only "$P" "$R" | grep -Ev '^(IMPLEMENTATION|TARGET|SESSION)\.md$' >/dev/null; then return 1; fi
     if [[ -n "${INPUT_KEY:-}" ]]; then
         input_queue matches-plan "$INPUT_KEY" "$R" || return 1
     fi
 }
 
-recover_review_cache_from_logs() {
-    local H B LOG STATUS_VALUE REVIEW_VALUE NEXT_VALUE REVIEW_SHA
-
-    H=$(head_sha)
-    B=$(branch)
-
-    while IFS= read -r LOG; do
-        [[ -n "$LOG" ]] || continue
-
-        STATUS_VALUE=$(
-            grep '^REVIEW_STATUS:' "$LOG" |
-            tail -n 1 |
-            sed 's/^REVIEW_STATUS: //' ||
-            true
-        )
-
-        case "$STATUS_VALUE" in
-            PASS|PROBLEMS|DONE|BLOCKED) ;;
-            *) continue ;;
-        esac
-
-        REVIEW_VALUE=$(
-            grep '^REVIEW:' "$LOG" |
-            tail -n 1 |
-            sed 's/^REVIEW: //' ||
-            true
-        )
-
-        NEXT_VALUE=$(
-            grep '^NEXT_STEP:' "$LOG" |
-            tail -n 1 |
-            sed 's/^NEXT_STEP: //' ||
-            true
-        )
-
-        REVIEW_SHA=$(
-            grep '^REVIEWED_SHA:' "$LOG" |
-            tail -n 1 |
-            sed 's/^REVIEWED_SHA: //' ||
-            true
-        )
-
-        [[ "$REVIEW_SHA" == "$H" ]] || continue
-        [[ "$(sed -n 's/^AUTOCYCLE_REVIEW_INPUT: //p' "$LOG" | tail -n 1)" == "${INPUT_KEY:-}" ]] || continue
-        [[ -n "$REVIEW_VALUE" ]] || continue
-        [[ -n "$NEXT_VALUE" ]] || continue
-
-        {
-            echo "CACHE_BRANCH: $B"
-            echo "INPUT_BATCH: ${INPUT_KEY:-}"
-            echo "REVIEW_STATUS: $STATUS_VALUE"
-            echo "REVIEW: $REVIEW_VALUE"
-            echo "NEXT_STEP: $NEXT_VALUE"
-            echo "REVIEWED_SHA: $REVIEW_SHA"
-        } > "$CACHE"
-
-        return 0
-
-    done < <(
-        ls -1t "$AC_DIR"/review-*.log 2>/dev/null || true
-    )
-
-    return 1
-}
-
+# Only atomic, current-policy caches can authorize transitions. Old logs remain
+# evidence; reconstructing decisions from provider transcripts is unsafe.
 review_cache_matches_head() {
-    local CACHED_BRANCH
-    local CACHED_STATUS
-    local CACHED_SHA
-
-    if [[ ! -f "$CACHE" ]]; then
-        recover_review_cache_from_logs || return 1
-    fi
-
-    CACHED_BRANCH=$(
-        grep '^CACHE_BRANCH:' "$CACHE" |
-        tail -n 1 |
-        sed 's/^CACHE_BRANCH: //' ||
-        true
-    )
-
-    CACHED_STATUS=$(
-        grep '^REVIEW_STATUS:' "$CACHE" |
-        tail -n 1 |
-        sed 's/^REVIEW_STATUS: //' ||
-        true
-    )
-
-    CACHED_SHA=$(
-        grep '^REVIEWED_SHA:' "$CACHE" |
-        tail -n 1 |
-        sed 's/^REVIEWED_SHA: //' ||
-        true
-    )
-
-    if [[ "$CACHED_BRANCH" != "$(branch)" ||
-          "$CACHED_SHA" != "$(head_sha)" ]]; then
-
-        rm -f "$CACHE"
-
-        recover_review_cache_from_logs || return 1
-
-        CACHED_BRANCH=$(
-            grep '^CACHE_BRANCH:' "$CACHE" |
-            tail -n 1 |
-            sed 's/^CACHE_BRANCH: //' ||
-            true
-        )
-
-        CACHED_STATUS=$(
-            grep '^REVIEW_STATUS:' "$CACHE" |
-            tail -n 1 |
-            sed 's/^REVIEW_STATUS: //' ||
-            true
-        )
-
-        CACHED_SHA=$(
-            grep '^REVIEWED_SHA:' "$CACHE" |
-            tail -n 1 |
-            sed 's/^REVIEWED_SHA: //' ||
-            true
-        )
-    fi
-
-    case "$CACHED_STATUS" in
-        PASS|PROBLEMS|DONE|BLOCKED) ;;
-        *) return 1 ;;
-    esac
-
-    [[ "$CACHED_BRANCH" == "$(branch)" ]] || return 1
-    [[ "$(sed -n 's/^INPUT_BATCH: //p' "$CACHE" | tail -n 1)" == "${INPUT_KEY:-}" ]] || return 1
-    [[ "$CACHED_SHA" == "$(head_sha)" ]]
+    AUTOCYCLE_REVIEW_CYCLE="$RUN_CYCLE" adjudication valid "$CACHE" "${INPUT_CYCLE_ID:-}"
 }
 
 review_summary() {
@@ -673,7 +935,7 @@ review_summary() {
 
     grep '^REVIEW:' "$CACHE" \
         | tail -n 1 \
-        | sed 's/^REVIEW: /    Found: /' \
+        | sed "s/^REVIEW: /    ${1:-Found}: /" \
         || true
 }
 
@@ -685,6 +947,12 @@ plan_title_from_sha() {
 }
 
 infer_state() {
+    if [[ -f "$AC_DIR/candidate.json" ]]; then
+        STATE_BRANCH=$(branch)
+        STAGE="start"
+        save_state
+        return
+    fi
     fetch_remote
 
     STATE_BRANCH=$(branch)
@@ -733,11 +1001,6 @@ infer_state() {
     save_state
 }
 
-if [[ "$MODE" != "--dry-run" ]]; then
-    pause_if_requested
-    ensure_network || fail "network/VPN preflight failed."
-fi
-
 # ------------------------------------------------------------
 # Dry run
 # ------------------------------------------------------------
@@ -750,19 +1013,26 @@ fi
 # Manual stages
 # ------------------------------------------------------------
 if [[ "$MODE" == "--review-only" || "$MODE" == "--plan-only" || "$MODE" == "--implement-only" ]]; then
-    input_queue guard-manual || fail "resume the active instruction cycle with autocycle N."
+    if [[ -f "$STATE" ]]; then
+        SESSION_NUMBER=$(load_state && printf '%s' "$SESSION_NUMBER") || fail "cannot read saved Session number."
+    fi
+    export AUTOCYCLE_SESSION_NUMBER="$SESSION_NUMBER"
+    input_queue guard-manual || fail "continue the active Session with --resume."
 fi
 
 if [[ "$MODE" == "--review-only" ]]; then
-    "$ENGINE" --review-only
+    run_engine_stage --review-only 0
 
+    progress admit-office-review "$CACHE" || fail "cannot persist Review admission; evidence preserved."
     RUN_MAX=1
     RUN_CYCLE=1
     STAGE="review_done"
+    if grep -qx 'REVIEW_STATUS: DONE' "$CACHE"; then STAGE=session_complete; fi
     PLAN_SHA=""
     STATE_BRANCH=$(branch)
 
     save_state
+    review_prune_finish
     pause_if_requested
     exit 0
 fi
@@ -785,7 +1055,7 @@ fi
 
 if [[ "$MODE" == "--implement-only" ]]; then
     IMPLEMENT_BASE_SHA=$(head_sha)
-    AUTOCYCLE_ALLOW_DIRTY=1 "$ENGINE" --implement-only
+    run_engine_stage --implement-only 1
     [[ "$(head_sha)" == "$IMPLEMENT_BASE_SHA" ]] || fail "implementation changed HEAD."
     assert_owned_docs "$IMPLEMENT_BASE_SHA"
 
@@ -803,24 +1073,129 @@ fi
 # Load or infer resumable state
 # ------------------------------------------------------------
 
+preserve_for_restart() {
+    ensure_network || fail "restart needs a reachable remote."
+    fetch_remote
+    # Reuse the normal ownership and provider-result guards before touching files.
+    if dirty; then
+        (assert_owned_docs "${IMPLEMENT_BASE_SHA:-${PLAN_SHA:-HEAD}}") >/dev/null 2>&1 && adjudication checkpoint-safe >/dev/null 2>&1 \
+            || fail "restart refused: uncheckpointed work has uncertain ownership; preserve it and reconcile first."
+        STAGE=checkpoint_pending
+        CHECKPOINT_UNSAFE=1
+        save_state
+        boundary_begin Checkpoint
+        if OUT=$(AUTOCYCLE_CHECKPOINT_GUARD=1 checkpoint "Partial: Step $(progress step-summary) — Session restarted" 2>&1); then :; else
+            RC=$?; [[ "$RC" != 76 ]] || exit 76
+            fail "restart checkpoint could not be published; saved recovery state and work are preserved."
+        fi
+        STATE_BRANCH=$(branch)
+        STAGE=checkpoint_done
+        save_state
+        boundary_done Checkpoint "✓" "$(git rev-parse --short HEAD)"
+    fi
+    ! dirty && [[ "$(remote_sha)" == "$(head_sha)" ]] \
+        || fail "restart refused: local work must be safely checkpointed and published first."
+    (assert_owned_docs "${IMPLEMENT_BASE_SHA:-${PLAN_SHA:-HEAD}}") \
+        || fail "restart refused: planning-document ownership is unresolved."
+    progress checkpoint checkpoint "${INPUT_CYCLE_ID:-}" || fail "cannot preserve the previous work attempt."
+}
+
+HAD_STATE=0
 if load_state; then
-    [[ "$RUN_MAX" == "$MAX_CYCLES" ]] \
-        || fail "unfinished run expects $RUN_MAX cycles; rerun: autocycle $RUN_MAX"
-
-    CURRENT_BRANCH=$(branch)
-
-    if [[ -n "${STATE_BRANCH:-}" &&
-          "$STATE_BRANCH" != "$CURRENT_BRANCH" ]]; then
-
-        fail "resume state belongs to $STATE_BRANCH, but current branch is $CURRENT_BRANCH."
-    fi
+    HAD_STATE=1
 else
+    [[ "$MODE" != --extend && "$MODE" != --resume ]] || fail "no saved Session to resume or extend."
     infer_state
-    # Only a genuinely new cycle may acquire pending input. Existing exported
-    # states and inferred in-flight plans remain frozen without new input.
-    if [[ "$STAGE" == "start" ]]; then
-        INPUT_ALLOW_NEW=1
+    # Recognized in-flight legacy work is the unfinished first Session.
+    if [[ "$STAGE" != start || -f "$AC_DIR/candidate.json" ]]; then HAD_STATE=1; fi
+fi
+[[ -z "$STATE_BRANCH" || "$STATE_BRANCH" == "$(branch)" ]] \
+    || fail "resume state belongs to $STATE_BRANCH, but current branch is $(branch)."
+
+START_SESSION=0
+if [[ "$STAGE" == session_complete ]]; then
+    save_state  # Retry an interrupted post-completion GC under the same lock.
+    if [[ "$MODE" == --resume ]]; then echo "AutoCycle stopped."; exit 0; fi
+    [[ "$MODE" != --extend ]] || fail "Session $SESSION_NUMBER is complete. Start with autocycle <cycles>."
+    START_SESSION=1
+elif [[ "$STAGE" == session_restarted ]]; then
+    # Resume the already-authorized transition after interruption, exactly once.
+    if [[ "$MODE" == --resume ]]; then MAX_CYCLES="$RUN_MAX"; fi
+    [[ "$MODE" != --extend ]] || fail "restart is pending; use --resume."
+    START_SESSION=1
+elif [[ "$HAD_STATE" == 0 ]]; then
+    [[ "$MODE" != --resume ]] || fail "no unfinished Session to resume."
+    START_SESSION=1
+elif [[ "$MODE" == run ]]; then
+    fail "Session $SESSION_NUMBER is unfinished. Use --resume, --extend, or --restart."
+fi
+
+input_queue import-legacy || fail "cannot verify instruction delivery; original evidence preserved."
+if [[ "$MODE" == --resume || "$MODE" == --extend ]]; then
+    LEGACY_REVIEW_STARTED=$(node -e 'console.log(Date.now())')
+    if progress resume-missing-evidence "$CACHE" >/dev/null; then
+        review_clock_begin "$LEGACY_REVIEW_STARTED"
+    else
+        LEGACY_RC=$?
+        [[ "$LEGACY_RC" == 3 ]] || fail "legacy evidence transition failed; state preserved."
     fi
+fi
+if [[ "$MODE" == --resume || "$MODE" == --extend ]]; then
+    if progress migrate-observations "$CACHE"; then
+        STAGE=start
+        save_state
+    else
+        OBSERVATION_RC=$?
+        [[ "$OBSERVATION_RC" == 3 ]] || fail "legacy observation migration failed; original evidence preserved."
+    fi
+fi
+progress recover "$STAGE" "${PLAN_SHA:-}" "${IMPLEMENT_BASE_SHA:-}" "${INPUT_CYCLE_ID:-}" \
+    || fail "cannot preserve pending work identity."
+
+if [[ "$MODE" == --restart && "$START_SESSION" == 0 ]]; then
+    preserve_for_restart
+    cycle_finish
+    START_SESSION=1
+    STAGE=session_restarted
+fi
+if [[ -n "$NEW_INSTRUCTION" ]]; then
+    input_queue -- --instruct "$NEW_INSTRUCTION" || fail "cannot queue the Session instruction."
+fi
+if [[ "$START_SESSION" == 1 ]]; then
+    if [[ "$STAGE" == session_complete || "$STAGE" == session_restarted ]]; then
+        END_REASON=completed
+        if [[ "$STAGE" == session_restarted ]]; then END_REASON=restarted; fi
+        # This terminal boundary makes ledger reset/session increment resumable.
+        RUN_CYCLE=1
+        RUN_MAX="$MAX_CYCLES"
+        save_state
+        progress new-session "$END_REASON" "$SESSION_NUMBER" || fail "cannot preserve prior Session evidence."
+        SESSION_NUMBER=$((SESSION_NUMBER + 1))
+    fi
+    RUN_MAX="$MAX_CYCLES"
+    RUN_CYCLE=1
+    SESSION_NEW=1
+    STAGE=boundary_input
+    NEXT_INPUT_ID=$(input_queue new-id)
+    INPUT_ALLOW_NEW=0
+    PLAN_SHA=""
+    IMPLEMENT_BASE_SHA=""
+    BOUNDARY_KIND=checkpoint
+    CHECKPOINT_UNSAFE=0
+    CANDIDATE_RESOLVED=0
+    NETWORK_RETRIES=0
+    rm -f "$CACHE"
+    save_state
+elif [[ "$MODE" == --extend ]]; then
+    RUN_MAX=$((RUN_MAX + MAX_CYCLES))
+    save_state
+fi
+export AUTOCYCLE_SESSION_NUMBER="$SESSION_NUMBER"
+# Normalize the previous candidate's post-checkpoint review boundary without
+# rewriting its work/evidence or treating allowance exhaustion as completion.
+if [[ "$BOUNDARY_KIND" == session_review ]]; then
+    STAGE=checkpoint_done
+    BOUNDARY_KIND=checkpoint
     save_state
 fi
 
@@ -828,9 +1203,64 @@ LAST_PRINTED_CYCLE=0
 
 while (( RUN_CYCLE <= RUN_MAX )); do
 
-    pause_if_requested
     [[ -z "${STATE_BRANCH:-}" || "$(branch)" == "$STATE_BRANCH" ]] || fail "resume branch changed; state preserved."
 
+    export AUTOCYCLE_REVIEW_CYCLE="$RUN_CYCLE"
+    export AUTOCYCLE_NEW_SESSION="$SESSION_NEW"
+    if [[ ( "$MODE" == --resume || "$MODE" == --extend ) && "${LEGACY_EVIDENCE_TRIED:-0}" != 1 ]]; then
+        LEGACY_EVIDENCE_TRIED=1
+        if progress resume-missing-evidence "$CACHE" >/dev/null; then
+            if [[ "$STAGE" == checkpoint_done ]]; then
+                progress checkpoint "${BOUNDARY_KIND:-checkpoint}" "${INPUT_CYCLE_ID:-}" || fail "cannot preserve legacy checkpoint."
+            fi
+            STAGE=start
+            save_state
+        else
+            LEGACY_RC=$?
+            [[ "$LEGACY_RC" == 3 ]] || fail "legacy evidence transition failed; state preserved."
+        fi
+    fi
+    if [[ "$STAGE" == checkpoint_pending ]]; then
+        # Checkpoint may have committed or failed before interruption. Never sweep
+        # edits or repeat it; the next Review diagnoses the actual local evidence.
+        STAGE=checkpoint_done
+        CHECKPOINT_UNSAFE=1
+        save_state
+    fi
+    if [[ "$STAGE" == checkpoint_done ]]; then
+        progress checkpoint "${BOUNDARY_KIND:-checkpoint}" "${INPUT_CYCLE_ID:-}" || fail "cannot persist checkpoint attempt; evidence preserved."
+        cycle_finish
+        pause_if_requested
+        if (( RUN_CYCLE >= RUN_MAX )); then
+            if [[ "${BOUNDARY_KIND:-checkpoint}" == checkpoint ]]; then
+                echo "Cycle allowance exhausted; Session incomplete; checkpoint saved and Review pending."
+            else
+                echo "Run limit reached; local evidence saved; review pending."
+            fi
+            exit 0
+        fi
+        RUN_CYCLE=$((RUN_CYCLE + 1))
+        STAGE=boundary_input
+        NEXT_INPUT_ID=$(input_queue new-id)
+        save_state
+        continue
+    fi
+    # Resolve saved publication before opening the resumed stage clock.
+    if [[ "$STAGE" == planning ]]; then
+        ensure_network || fail "network preflight failed."
+        fetch_remote
+        if ! dirty && remote_plan_child_of_head; then
+            if [[ -f "$AC_DIR/planned-commit" ]]; then
+                read -r PLAN_SHA PUBLISHED_BRANCH < "$AC_DIR/planned-commit" || fail "invalid Plan publication record."
+                [[ "$PLAN_SHA" == "$(remote_sha)" && "$PUBLISHED_BRANCH" == "$(branch)" ]] || fail "published Plan changed before Baseline."
+            else
+                # Authenticated legacy state: direct plan child with only owned documents.
+                PLAN_SHA=$(remote_sha)
+            fi
+            STAGE=plan_done
+        elif review_cache_matches_head; then STAGE=review_done; else STAGE=start; fi
+        save_state
+    fi
     if [[ "$LAST_PRINTED_CYCLE" != "$RUN_CYCLE" ]]; then
         echo
         echo "Cycle       $RUN_CYCLE/$RUN_MAX"
@@ -839,11 +1269,96 @@ while (( RUN_CYCLE <= RUN_MAX )); do
         LAST_PRINTED_CYCLE="$RUN_CYCLE"
     fi
 
-    if [[ "$STAGE" != "checkpoint_done" ]]; then
-        prepare_cycle_input
+    case "$STAGE" in
+        plan_done) controller_stage Plan ;;
+        implementing|implement_done|implement_nochange|candidate_checkpoint) controller_stage Implement ;;
+        *) controller_stage Review ;;
+    esac
+
+    if [[ "$STAGE" == boundary_input ]]; then
+        input_queue rollover "${INPUT_CYCLE_ID:-}" "$NEXT_INPUT_ID" "$(branch)" "$(head_sha)" >/dev/null \
+            || fail "cannot admit boundary input; state preserved."
+        INPUT_CYCLE_ID="$NEXT_INPUT_ID"
+        NEXT_INPUT_ID=""
+        INPUT_ALLOW_NEW=0
+        STAGE=start
+        BOUNDARY_KIND=checkpoint
+        PLAN_SHA=""
+        # Keep IMPLEMENT_BASE_SHA until protected-document verification before Plan.
+        save_state
+        continue
     fi
 
-    fetch_remote
+    # A stale semantic decision is re-adjudicated at this exact boundary before
+    # recovery dispatch or input rollover. Keep checkpoint, evidence and batch.
+    STALE_REVIEW=0
+    if [[ "$STAGE" == review_done || "$STAGE" == start || "$STAGE" == reviewing ]] \
+        && [[ -f "$CACHE" ]] && ! review_cache_matches_head; then
+        STALE_REVIEW=1
+        STAGE=start
+        save_state
+    fi
+
+    # Explicit-resume recovery may itself inspect Office or enqueue views.
+    # All of it prepares the next Review and shares that Review's clock.
+    if [[ "$MODE" == --resume && "${JUST_COMPLETED_REVIEW:-0}" != 1 ]] \
+        && [[ "$STAGE" == start || "$STAGE" == reviewing || "$STAGE" == review_done ]]; then
+        review_clock_begin
+    fi
+
+    # Recovery belongs before every fresh-Review entry, including the input
+    # rollover below. Keeping this inside review_done lets start/rollover run
+    # Review first; JUST_COMPLETED_REVIEW then suppresses the saved recovery.
+    # Dispatch only the saved verdict, once per explicit resume.
+    # The helper returns 3 when no recovery applies; every actual failure stops
+    # here with its concrete evidence, leaving the saved boundary retryable.
+    if [[ "$MODE" == --resume && "${EXCEL_RESUME_TRIED:-0}" == 0 && "${JUST_COMPLETED_REVIEW:-0}" != 1 ]] \
+        && [[ "$STAGE" == review_done || "$STAGE" == start || "$STAGE" == reviewing ]] \
+        && review_cache_matches_head && grep -qx 'REVIEW_STATUS: BLOCKED' "$CACHE"; then
+        EXCEL_RESUME_TRIED=1
+        set +e
+        EXCEL_RECOVERY=$(python3 "$(dirname "$ADJUDICATOR")/excel_verification.py" --resume-blocker "$CACHE")
+        EXCEL_RC=$?
+        set -e
+        if [[ "$EXCEL_RC" == 0 ]]; then
+            export AUTOCYCLE_EXCEL_RECOVERY="$EXCEL_RECOVERY"
+            STAGE=start
+            save_state
+        elif [[ "$EXCEL_RC" != 3 ]]; then
+            printf '%s\n' "$EXCEL_RECOVERY"
+            exit "$EXCEL_RC"
+        fi
+    fi
+
+    # New recovery instructions enter through the existing immutable batch boundary.
+    # They trigger fresh Review, but never clear the durable progress block themselves.
+    if [[ "$STAGE" == review_done || "$STAGE" == start || "$STAGE" == reviewing ]] \
+        && [[ "${JUST_COMPLETED_REVIEW:-0}" != 1 ]] \
+        && { progress blocked || { review_cache_matches_head && grep -qx 'REVIEW_STATUS: BLOCKED' "$CACHE"; }; } \
+        && [[ "$STALE_REVIEW" != 1 ]] \
+        && (( $(input_queue pending-count) > 0 )); then
+        STAGE=boundary_input
+        NEXT_INPUT_ID=$(input_queue new-id)
+        save_state
+        continue
+    fi
+
+
+    prepare_cycle_input
+
+    # A provider may have persisted its blocker before the controller was stopped.
+    if [[ -f "$AC_DIR/candidate.json" && "${CANDIDATE_RESOLVED:-0}" != "$(adjudication candidate-key)" && ( "$STAGE" == implementing || "$STAGE" == planning ) ]]; then
+        if [[ "$STAGE" == planning ]]; then STAGE=checkpoint_done; BOUNDARY_KIND=planning; else STAGE=candidate_checkpoint; fi
+        save_state
+        continue
+    fi
+
+    # Opening Review can diagnose local-only evidence. Publication is checked
+    # before Plan and Sync, never made a prerequisite for read-only diagnosis.
+    if [[ "$STAGE" == planning || "$STAGE" == plan_done || "$STAGE" == implementing ]]; then
+        ensure_network || fail "network/VPN preflight failed."
+        fetch_remote
+    fi
 
     # --------------------------------------------------------
     # Recover if review actually finished before interruption
@@ -854,67 +1369,40 @@ while (( RUN_CYCLE <= RUN_MAX )); do
         save_state
     fi
 
-    # --------------------------------------------------------
-    # Recover if planning actually pushed before interruption
-    # --------------------------------------------------------
-
-    if [[ "$STAGE" == "planning" ]] \
-        && ! dirty \
-        && remote_plan_child_of_head; then
-
-        PLAN_SHA=$(remote_sha)
-        STAGE="plan_done"
-        save_state
-    fi
-
-    # --------------------------------------------------------
-    # Recover if checkpoint committed before interruption
-    # --------------------------------------------------------
-
-    if [[ "$STAGE" == "implement_done" ]]; then
-        [[ -n "${PLAN_SHA:-}" ]] || fail "missing plan baseline; cannot verify ownership."
-        assert_owned_docs "${IMPLEMENT_BASE_SHA:-$PLAN_SHA}"
-        CURRENT=$(head_sha)
-
-        if [[ -z "$(git status --porcelain)" \
-            && -n "$PLAN_SHA" \
-            && "$CURRENT" != "$PLAN_SHA" ]] \
-            && git merge-base --is-ancestor "$PLAN_SHA" "$CURRENT" 2>/dev/null; then
-
-            CURRENT_BRANCH=$(branch)
-
-            if [[ "$(git rev-parse "origin/$CURRENT_BRANCH" 2>/dev/null || true)" != "$CURRENT" ]]; then
-                git push -u origin "$CURRENT_BRANCH" >/dev/null 2>&1 \
-                    || fail "could not resume checkpoint push."
-
-                fetch_remote
-            fi
-
-            STAGE="checkpoint_done"
-            STATE_BRANCH="$CURRENT_BRANCH"
-
-            save_state
-        fi
-    fi
-
     case "$STAGE" in
+
+        candidate_checkpoint)
+            # Save before attempting checkpoint: a restart diagnoses the preserved
+            # evidence rather than replaying implementation or sweeping new edits.
+            STAGE="checkpoint_pending"
+            CHECKPOINT_UNSAFE=1
+            save_state
+            if dirty; then
+                if adjudication checkpoint-safe && (assert_owned_docs "${IMPLEMENT_BASE_SHA:-HEAD}"); then
+                    boundary_begin Checkpoint
+                    if OUT=$(AUTOCYCLE_CHECKPOINT_GUARD=1 checkpoint "Partial: Step $(progress step-summary) — blocker evidence (acceptance unresolved)" 2>&1); then
+                        boundary_done Checkpoint "✓" "partial work preserved; acceptance unresolved"
+                    else
+                        RC=$?; [[ "$RC" != 76 ]] || exit 76
+                        boundary_done Checkpoint "↪" "failed; local evidence → Review"
+                        printf '%s\n' "$OUT" > "$AC_DIR/blocker-checkpoint-failure.log"
+                    fi
+                else
+                    boundary_done Checkpoint "–" "unsafe to commit; local evidence → Review"
+                fi
+            else
+                boundary_done Checkpoint "–" "skipped (no changes)"
+            fi
+            STATE_BRANCH=$(branch)
+            STAGE=checkpoint_done
+            save_state
+            continue
+            ;;
 
         reviewing)
             # Interrupted review with no completed cache:
             # rerun review, not the whole cycle.
             STAGE="start"
-            save_state
-            continue
-            ;;
-
-        planning)
-            # Preserve a completed review when planning was interrupted.
-            if review_cache_matches_head; then
-                STAGE="review_done"
-            else
-                STAGE="start"
-            fi
-
             save_state
             continue
             ;;
@@ -925,7 +1413,7 @@ while (( RUN_CYCLE <= RUN_MAX )); do
             save_state
 
             set +e
-            run_engine_stage --review-only 0
+            AUTOCYCLE_LOCAL_REVIEW=1 run_engine_stage --review-only 1
             RC=$?
             set -e
 
@@ -933,7 +1421,7 @@ while (( RUN_CYCLE <= RUN_MAX )); do
                 continue
             fi
 
-            [[ "$RC" -eq 0 ]]                 || fail "review stage."
+            [[ "$RC" -eq 0 ]]                 || fail "opening review unavailable or malformed; evidence preserved. Logs: $AC_DIR"
 
             STAGE="review_done"
             save_state
@@ -943,16 +1431,56 @@ while (( RUN_CYCLE <= RUN_MAX )); do
             ;;
 
         review_done)
-            if [[ -n "${INPUT_KEY:-}" ]] && ! review_cache_matches_head; then
+            # Recover a previously committed checkpoint whose push lost a race
+            # with document-only owner edits. This precedes acceptance/Plan.
+            if [[ -f "$AC_DIR/implementation-baseline.json" ]]; then
+                fetch_remote
+                set +e
+                REMOTE_DOCS_OUT=$(python3 "$HOME/.autocycle/remote_docs.py" settle 2>&1)
+                REMOTE_DOCS_RC=$?
+                set -e
+                if [[ "$REMOTE_DOCS_RC" == 10 ]]; then
+                    review_prune_finish
+                    printf '%s\n' "$REMOTE_DOCS_OUT"
+                    rm -f "$CACHE"
+                    STAGE=start
+                    save_state
+                    continue
+                fi
+                [[ "$REMOTE_DOCS_RC" == 0 ]] || fail "$REMOTE_DOCS_OUT"
+            fi
+            if ! review_cache_matches_head; then
+                review_prune_finish
                 STAGE="start"
+                save_state
+                continue
+            fi
+            # A saved Review or progress block describes the previous observation, not
+            # the current environment. Re-review once in this same boundary.
+            # Keep the cache until Review atomically replaces it, along with
+            # all Session, Cycle, Step and frozen-input recovery evidence.
+            if [[ "$MODE" == --resume && "${JUST_COMPLETED_REVIEW:-0}" != 1 ]] \
+                && { progress blocked || grep -qx 'REVIEW_STATUS: BLOCKED' "$CACHE"; }; then
+                STAGE=start
                 save_state
                 continue
             fi
             if [[ "${JUST_COMPLETED_REVIEW:-0}" == "1" ]]; then
                 JUST_COMPLETED_REVIEW=0
             elif review_cache_matches_head; then
-                echo "Review      ✓ resumed"
-                review_summary
+                review_clock_begin
+                controller_refresh_stop
+                REVIEW_DISPLAY_STATE="$DISPLAY_STATE"
+                controller_refresh_start
+                REVIEW_PRUNE_FILES=0; REVIEW_PRUNE_BYTES=0
+                REVIEW_PRUNE_STARTED=0; REVIEW_PRUNE_CLOSED=0
+                REVIEW_FINDING=$(sed -n 's/^REVIEW: //p' "$CACHE" | tail -n 1)
+                if grep -qx 'REVIEW_STATUS: BLOCKED' "$CACHE"; then
+                    REVIEW_FINDING="Blocked: $REVIEW_FINDING; Action: $(sed -n 's/^HUMAN_ACTION: //p' "$CACHE")"
+                fi
+                node "$(dirname "$ADJUDICATOR")/stage_display.js" "$REVIEW_DISPLAY_STATE" Review clock >/dev/null
+                node "$(dirname "$ADJUDICATOR")/stage_display.js" "$REVIEW_DISPLAY_STATE" Review event "✓ Found   $REVIEW_FINDING"
+                review_prune_begin
             fi
 
             REVIEW_STATUS_VALUE=$(
@@ -962,22 +1490,84 @@ while (( RUN_CYCLE <= RUN_MAX )); do
                 true
             )
 
-            if [[ "$REVIEW_STATUS_VALUE" == "DONE" ]]; then
-                if [[ -n "${INPUT_KEY:-}" ]]; then
-                    echo "BLOCKED: active human instructions require a published plan; input retained."
+            set +e
+            PROGRESS_DECISION=$(progress guard "$CACHE" "${INPUT_CYCLE_ID:-}")
+            PROGRESS_RC=$?
+            set -e
+            if [[ "$PROGRESS_RC" == 2 || "$PROGRESS_RC" == 4 ]]; then
+                save_state
+            fi
+            if [[ "$PROGRESS_RC" == 4 ]]; then
+                review_prune_finish
+                # A fresh BLOCKED verdict is terminal even when progress is
+                # unknown; the normal recheck must not run a second Review.
+                if [[ "$REVIEW_STATUS_VALUE" == BLOCKED ]]; then
                     exit 2
                 fi
-                clear_state
+                node "$(dirname "$ADJUDICATOR")/stage_display.js" "$DISPLAY_STATE" Review event "↪ $PROGRESS_DECISION"
+                rm -f "$CACHE"
+                STAGE=start
+                save_state
+                continue
+            fi
+            if [[ "$PROGRESS_RC" == 2 ]]; then
+                review_prune_finish
+                # A valid unresolved Review retains its concrete blocker/action,
+                # including after a later recheck records PROGRESS_UNKNOWN.
+                if [[ "$REVIEW_STATUS_VALUE" != BLOCKED ]]; then
+                    echo "BLOCKED     $PROGRESS_DECISION"
+                fi
+                if [[ "$(progress observation-requests)" != '[]' ]]; then
+                    echo "Replacement observations remain recoverable with autocycle --resume."
+                else
+                    echo "Queue a concrete revised approach or a new evidence path with autocycle --instruct."
+                fi
+                exit 2
+            fi
+            [[ "$PROGRESS_RC" == 0 ]] || fail "cannot persist progress decision; evidence and input preserved."
+            OBSERVATION_REQUESTS=""
+
+            if [[ -n "${INPUT_CYCLE_ID:-}" && "$(sed -n 's/^INPUT_STATUS: //p' "$CACHE")" == COMPLETE ]]; then
+                input_queue complete "$INPUT_CYCLE_ID" "$(head_sha)" \
+                    || fail "instruction archival failed; valid opening Review and input preserved."
+            fi
+
+            save_state
+
+            if [[ "$REVIEW_STATUS_VALUE" == "DONE" ]]; then
+                # Only the accepted opening Review can finish a Session. Its
+                # state is already checkpointed; do not manufacture a new commit.
+                ! dirty && [[ "$(remote_sha)" == "$(head_sha)" ]] || fail "Completed Review requires a safely published checkpoint."
+                (assert_owned_docs "${IMPLEMENT_BASE_SHA:-HEAD}") || fail "checkpoint ownership is uncertain."
+                input_queue close-empty "$INPUT_CYCLE_ID" || fail "active instruction cannot be discarded."
+                STAGE=session_complete
+                save_state
+                review_prune_finish
                 exit 0
             fi
 
+            review_prune_finish
             if [[ "$REVIEW_STATUS_VALUE" == "BLOCKED" ]]; then
-                echo
-                echo "BLOCKED"
-                review_summary
                 exit 2
             fi
 
+            if dirty || [[ "$(remote_sha)" != "$(head_sha)" ]]; then
+                fail "local work is not safely checkpointed/published; read-only Review retained. Reconcile Git/ownership before Plan. Logs: $AC_DIR"
+            fi
+            if [[ -n "${IMPLEMENT_BASE_SHA:-}" ]]; then
+                git merge-base --is-ancestor "$IMPLEMENT_BASE_SHA" HEAD || fail "implementation baseline is not an ancestor; owner reconciliation required."
+            elif [[ "${CHECKPOINT_UNSAFE:-0}" == 1 ]]; then
+                fail "missing checkpoint ownership baseline; preserve evidence and reconcile with the owner before Plan."
+            fi
+            (assert_owned_docs "${IMPLEMENT_BASE_SHA:-HEAD}") || fail "protected documents changed; work preserved for owner reconciliation."
+            ensure_network || fail "network/VPN preflight failed."
+            fetch_remote
+            [[ "$(remote_sha)" == "$(head_sha)" ]] || fail "branch changed remotely; Plan blocked."
+            CHECKPOINT_UNSAFE=0
+            IMPLEMENT_BASE_SHA=""
+            if [[ -f "$AC_DIR/candidate.json" ]]; then CANDIDATE_RESOLVED=$(adjudication candidate-key); fi
+            if [[ "$SESSION_NEW" != 1 ]] && progress endpoint-reached "$CACHE"; then BOUNDARY_KIND=endpoint_update; fi
+            controller_stage Plan
             STAGE="planning"
             save_state
 
@@ -990,11 +1580,26 @@ while (( RUN_CYCLE <= RUN_MAX )); do
                 continue
             fi
 
+            if [[ "$RC" -eq 42 ]]; then
+                CANDIDATE_RESOLVED=0
+                STAGE=checkpoint_done
+                BOUNDARY_KIND=planning
+                save_state
+                continue
+            fi
+            if [[ "$RC" == 78 ]]; then
+                # A stopped admission is not another project cycle. Explicit
+                # resume starts ordinary Review against current capabilities.
+                STAGE=start
+                save_state
+                exit 78
+            fi
             [[ "$RC" -eq 0 ]]                 || fail "planning stage."
 
             fetch_remote
 
-            PLAN_SHA=$(remote_sha)
+            [[ "$(remote_sha)" == "$PUBLISHED_PLAN_SHA" ]] || fail "published Plan changed before Baseline."
+            PLAN_SHA="$PUBLISHED_PLAN_SHA"
             STAGE="plan_done"
 
             save_state
@@ -1004,6 +1609,8 @@ while (( RUN_CYCLE <= RUN_MAX )); do
             ;;
 
         plan_done)
+            CANDIDATE_RESOLVED=0
+            rm -f "$AC_DIR/candidate.json" "$AC_DIR/implementation-baseline.json" "$AC_DIR/implementation-result.json" "$AC_DIR/native-handoff.json"
             if [[ -n "${INPUT_KEY:-}" ]]; then
                 input_queue published "$INPUT_KEY" "$PLAN_SHA" || fail "cannot bind input to the published plan."
             fi
@@ -1013,16 +1620,13 @@ while (( RUN_CYCLE <= RUN_MAX )); do
                 JUST_COMPLETED_PLAN=0
 
             elif [[ "$(head_sha)" != "$PLAN_SHA" ]]; then
-                echo "Plan        ✓ resumed"
-                echo "    Planned: $TITLE"
+                controller_stage Plan
+                node "$(dirname "$ADJUDICATOR")/stage_display.js" "$DISPLAY_STATE" Plan event "✓ Planned $TITLE"
             fi
 
-            if ! OUT=$(sync 2>&1); then
-                if ! network_ready; then
-                    network_recover                         || fail "network recovery failed during sync."
-                    continue
-                fi
-
+            boundary_begin Baseline
+            if ! OUT=$(AUTOCYCLE_BASELINE_SHA="$PLAN_SHA" AUTOCYCLE_BASELINE_BRANCH="$(branch)" sync 2>&1); then
+                boundary_done Baseline "✗" "baseline failed"
                 echo "$OUT"
                 fail "sync"
             fi
@@ -1030,10 +1634,20 @@ while (( RUN_CYCLE <= RUN_MAX )); do
             [[ "$(head_sha)" == "$PLAN_SHA" ]] \
                 || fail "sync did not reach the planned commit."
 
+            if [[ "$BOUNDARY_KIND" != endpoint_update ]]; then
+                adjudication baseline || fail "cannot authenticate the admitted implementation baseline."
+            fi
             STAGE="implementing"
+            if [[ "$BOUNDARY_KIND" == endpoint_update ]]; then
+                # Persist steering first, then reassess the updated Endpoint.
+                # A reached Endpoint must not admit another implementation.
+                STAGE=checkpoint_done
+                BOUNDARY_KIND=review
+            fi
+            SESSION_NEW=0
             save_state
 
-            echo "Sync        ✓ $(git rev-parse --short HEAD)"
+            boundary_done Baseline "✓" "$(git rev-parse --short HEAD)"
 
             continue
             ;;
@@ -1061,10 +1675,26 @@ while (( RUN_CYCLE <= RUN_MAX )); do
                 continue
             fi
 
-            [[ "$RC" -eq 0 ]]                 || fail "implementation stage."
+            if [[ "$RC" -eq 42 ]]; then
+                CANDIDATE_RESOLVED=0
+                STAGE="candidate_checkpoint"
+                save_state
+                continue
+            fi
+            if [[ "$RC" -eq 76 ]]; then
+                echo "Paused      – provider interruption. Resume: autocycle --resume"
+                exit 76
+            fi
+            [[ "$RC" -eq 0 ]]                 || fail "implementation stage; local work preserved, inspect provider log before resuming."
 
             [[ "$(head_sha)" == "$IMPLEMENT_BASE_SHA" ]] || fail "implementation changed HEAD."
-            assert_owned_docs "$IMPLEMENT_BASE_SHA"
+            if ! (assert_owned_docs "$IMPLEMENT_BASE_SHA"); then
+                printf 'Protected documents changed during implementation.\n' > "$AC_DIR/checkpoint-ownership.log"
+                adjudication candidate checkpoint "$AC_DIR/checkpoint-ownership.log" "${INPUT_CYCLE_ID:-}"
+                STAGE=candidate_checkpoint
+                save_state
+                continue
+            fi
             if dirty; then
                 STAGE="implement_done"
             else
@@ -1079,31 +1709,66 @@ while (( RUN_CYCLE <= RUN_MAX )); do
             ;;
 
         implement_nochange)
-            [[ -n "${IMPLEMENT_BASE_SHA:-}" ]] || fail "missing no-change verification baseline."
-            [[ "$(head_sha)" == "$IMPLEMENT_BASE_SHA" ]] || fail "HEAD changed after no-change verification."
-            ! dirty || fail "working files changed after no-change verification; state preserved."
-            assert_owned_docs "$IMPLEMENT_BASE_SHA"
-            [[ "$(remote_sha)" == "$IMPLEMENT_BASE_SHA" ]] || fail "no-change HEAD differs from GitHub; state preserved."
+            if [[ -z "${IMPLEMENT_BASE_SHA:-}" || "$(head_sha)" != "$IMPLEMENT_BASE_SHA" ]] || dirty || \
+               ! (assert_owned_docs "${IMPLEMENT_BASE_SHA:-HEAD}") || [[ "$(remote_sha)" != "$IMPLEMENT_BASE_SHA" ]]; then
+                printf 'No-change checkpoint evidence changed or is unpublished; owner reconciliation required.\n' > "$AC_DIR/checkpoint-ownership.log"
+                adjudication candidate checkpoint "$AC_DIR/checkpoint-ownership.log" "${INPUT_CYCLE_ID:-}"
+                STAGE=checkpoint_done
+                CHECKPOINT_UNSAFE=1
+                save_state
+                boundary_done Checkpoint "–" "unsafe; local evidence preserved"
+                continue
+            fi
             rm -f "$CACHE"
             STAGE="checkpoint_done"
             save_state
-            echo "Checkpoint  – skipped (no changes; proceeding to Review)"
+            boundary_done Checkpoint "–" "skipped (no changes)"
             continue
             ;;
 
         implement_done)
             [[ -n "${PLAN_SHA:-}" ]] || fail "missing plan baseline; cannot verify ownership."
-            assert_owned_docs "${IMPLEMENT_BASE_SHA:-$PLAN_SHA}"
             BEFORE=$(head_sha)
 
-            if ! OUT=$(checkpoint 2>&1); then
-                if ! network_ready; then
-                    network_recover                         || fail "network recovery failed during checkpoint."
-                    continue
-                fi
+            # A user may have checkpointed a stage-paused implementation. Do not
+            # run add/commit again or attribute later manual edits to the provider.
+            # Route clean descendant commits to the existing read-only Review;
+            # normal publication, ancestry and document guards still gate Plan.
+            if [[ "$BEFORE" != "${IMPLEMENT_BASE_SHA:-$PLAN_SHA}" ]]; then
+                dirty && fail "manual checkpoint has uncommitted work; checkpoint it before resuming."
+                git merge-base --is-ancestor "${IMPLEMENT_BASE_SHA:-$PLAN_SHA}" HEAD \
+                    || fail "manual checkpoint is not descended from the implementation baseline."
+                STAGE=checkpoint_done
+                CHECKPOINT_UNSAFE=1
+                save_state
+                boundary_done Checkpoint "–" "existing commit preserved; opening Review required"
+                continue
+            fi
 
-                echo "$OUT"
-                fail "checkpoint"
+            if ! (assert_owned_docs "${IMPLEMENT_BASE_SHA:-$PLAN_SHA}") || ! adjudication checkpoint-safe; then
+                printf 'BLOCKER: checkpoint ownership is uncertain; pre-existing work must be separated by its owner.\n' > "$AC_DIR/checkpoint-ownership.log"
+                adjudication candidate checkpoint "$AC_DIR/checkpoint-ownership.log" "${INPUT_CYCLE_ID:-}" || fail "cannot retain checkpoint evidence."
+                STAGE="checkpoint_done"
+                CANDIDATE_RESOLVED=0
+                CHECKPOINT_UNSAFE=1
+                boundary_done Checkpoint "–" "unsafe to commit; local evidence preserved"
+                save_state
+                continue
+            fi
+            STAGE=checkpoint_pending
+            CHECKPOINT_UNSAFE=1
+            save_state
+            boundary_begin Checkpoint
+            if OUT=$(AUTOCYCLE_CHECKPOINT_GUARD=1 checkpoint 2>&1); then :; else
+                RC=$?; [[ "$RC" != 76 ]] || exit 76
+                printf '%s\n' "$OUT" > "$AC_DIR/blocker-checkpoint-failure.log"
+                adjudication candidate checkpoint "$AC_DIR/blocker-checkpoint-failure.log" "${INPUT_CYCLE_ID:-}" || fail "cannot retain failed checkpoint evidence."
+                STAGE="checkpoint_done"
+                CANDIDATE_RESOLVED=0
+                STATE_BRANCH=$(branch)
+                boundary_done Checkpoint "↪" "failed; local evidence preserved"
+                save_state
+                continue
             fi
 
             AFTER=$(head_sha)
@@ -1125,32 +1790,7 @@ while (( RUN_CYCLE <= RUN_MAX )); do
 
             save_state
 
-            echo "Checkpoint  ✓ $(git rev-parse --short HEAD)"
-            continue
-            ;;
-
-        checkpoint_done)
-            if [[ -n "${INPUT_CYCLE_ID:-}" ]]; then
-                input_queue complete "$INPUT_CYCLE_ID" "$(head_sha)" || fail "input archival failed; state preserved."
-            fi
-            if (( RUN_CYCLE >= RUN_MAX )); then
-                clear_state
-                exit 0
-            fi
-
-            RUN_CYCLE=$((RUN_CYCLE + 1))
-            INPUT_CYCLE_ID=""
-            INPUT_ALLOW_NEW=1
-            INPUT_KEY=""
-
-            STAGE="start"
-            PLAN_SHA=""
-            IMPLEMENT_BASE_SHA=""
-            STATE_BRANCH=$(branch)
-
-            rm -f "$CACHE"
-
-            save_state
+            boundary_done Checkpoint "✓" "$(git rev-parse --short HEAD)"
             continue
             ;;
 
