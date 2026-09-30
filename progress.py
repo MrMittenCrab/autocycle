@@ -977,6 +977,13 @@ def _evaluate(s, path, batch):
                 for allocation in s['allocated'].values():
                     if allocation.get('work_id')==w['id']:allocation['status']='completed'
         return 0, 'Recovery accepted by Review'
+    if a and a['phase']!='checkpointed' and a.get('outcome')!='RECOVERED':
+        # Validation alone is not acceptance. Persist the opening Review of
+        # this exact attempt before guard authorizes Plan or another admission.
+        # review_report requires UNASSESSED here; block/recovery handling above
+        # must still run before an uncheckpointed attempt can be accepted.
+        a.update(review_token=token, outcome=r['outcome'], report=r, rechecks=0)
+        return 0, 'Opening Review recorded for uncheckpointed attempt'
     if a and a['phase']=='checkpointed':
         if a.get('outcome')=='RECOVERED':
             return 0, 'Explicitly revised approach already accepted for this attempt'
